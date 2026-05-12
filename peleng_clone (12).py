@@ -963,18 +963,32 @@ def parse_ud2102_record(addr: int, raw84: bytes) -> MeasurementRecord | None:
         s = i + start
         return raw84[s] if 0 <= s < len(raw84) else 0
 
-    num_obj  = reverse_bcd(_slice(10, 13))
-    plavka   = reverse_bcd(_slice(46, 10))
-    stamp    = _u16(52)
-    god      = _u16(54)
-    tcode    = _u16(34)
-    sub_b    = _u8(33)
-    side_b   = _u8(36)
-    sheika_b = _u8(57)
-    obod     = reverse_bcd(_slice(58, 3))
-    obtochka = reverse_bcd(_slice(61, 3))
-    greben   = reverse_bcd(_slice(64, 3))
-    naplavka = decode_naplavka(_u8(67))
+    # Смещения по документации PELENG_REVERSE.md § 2.5:
+    #   i+0..4   дата/время (уже разобрана выше)
+    #   i+5..6   tcode (LE16)
+    #   i+7      sub_b (u8)
+    #   i+10..18 плавка (Reverse-BCD, 9 байт)
+    #   i+20..28 № объекта (Reverse-BCD, 9 байт)
+    #   i+30     сторона (u8)
+    #   i+31     шейка (u8)
+    #   i+32..33 обод (LE16, десятые мм)
+    #   i+34     обточка (u8)
+    #   i+35..36 гребень (LE16, десятые мм)
+    #   i+37     наплавка (u8)
+    tcode    = _u16(5)
+    sub_b    = _u8(7)
+    plavka   = reverse_bcd(_slice(10, 9))
+    num_obj  = reverse_bcd(_slice(20, 9))
+    side_b   = _u8(30)
+    sheika_b = _u8(31)
+    obod     = str(_u16(32))             # LE16 десятые мм → строка
+    obtochka = str(_u8(34))              # u8 категория обточки → строка
+    greben   = str(_u16(35))             # LE16 десятые мм → строка
+    naplavka = decode_naplavka(_u8(37))
+    # stamp/god не имеют подтверждённых смещений в 84-байт BCD-паспорте;
+    # заполняются из FDB (INDMAKER/MAKETIME) при импорте.
+    stamp    = 0
+    god      = 0
 
     return MeasurementRecord(
         addr=addr, raw=bytes(raw84), anchor=anchor,
@@ -1437,36 +1451,51 @@ def make_fake_ud2102_record(seed: int = 0,
     body[i + 3] = now.hour & 0x1F
     body[i + 4] = now.minute & 0x3F
 
-    # Reverse BCD-поля: подгоняем длины с лимитом (анкер i=4 → i+10=14, поле 13 байт → до 27)
-    num = 12345 + seed
-    obj_bytes = _encode_reverse_bcd(str(num), 13)
-    body[i + 10:i + 10 + len(obj_bytes)] = obj_bytes
-
-    plav_bytes = _encode_reverse_bcd("3145" + str(seed % 100).zfill(2), 10)
-    body[i + 46:i + 46 + len(plav_bytes)] = plav_bytes
+    # Смещения по PELENG_REVERSE.md § 2.5 (от якоря i):
+    #   i+5..6   tcode (LE16)
+    #   i+7      sub_b (u8)
+    #   i+10..18 плавка (Reverse-BCD, 9 байт)
+    #   i+20..28 № объекта (Reverse-BCD, 9 байт)
+    #   i+30     сторона (u8)
+    #   i+31     шейка (u8)
+    #   i+32..33 обод (LE16, десятые мм)
+    #   i+34     обточка (u8)
+    #   i+35..36 гребень (LE16, десятые мм)
+    #   i+37     наплавка (u8)
 
     # tcode = 24667 (РУ1Ш если sub_b=0, РУ1 если sub_b=1) — варьируем по seed
     tcode = 24667
-    body[i + 33] = (seed % 2) & 0xFF        # sub_b
-    body[i + 34] = tcode & 0xFF
-    body[i + 35] = (tcode >> 8) & 0xFF
-    body[i + 36] = (seed % 2) & 0xFF        # сторона
-    body[i + 52] = (1234 & 0xFF)            # клеймо (LE)
-    body[i + 53] = (1234 >> 8) & 0xFF
-    body[i + 54] = ((2018 + (seed % 6)) & 0xFF)
-    body[i + 55] = (((2018 + (seed % 6)) >> 8) & 0xFF)
-    body[i + 57] = ((seed % 3) + 1) & 0xFF  # шейка: 1/2/3
+    body[i + 5] = tcode & 0xFF              # tcode LE16
+    body[i + 6] = (tcode >> 8) & 0xFF
+    body[i + 7] = (seed % 2) & 0xFF         # sub_b
 
-    obod_bytes = _encode_reverse_bcd(str(75 - (seed % 10)), 3)
-    body[i + 58:i + 58 + len(obod_bytes)] = obod_bytes
+    # Плавка @ i+10..18 (9 байт Reverse-BCD)
+    plav_bytes = _encode_reverse_bcd("3145" + str(seed % 100).zfill(2), 9)
+    body[i + 10:i + 10 + len(plav_bytes)] = plav_bytes
 
-    obtoch_bytes = _encode_reverse_bcd(str(2 + (seed % 5)), 3)
-    body[i + 61:i + 61 + len(obtoch_bytes)] = obtoch_bytes
+    # № объекта @ i+20..28 (9 байт Reverse-BCD)
+    num = 12345 + seed
+    obj_bytes = _encode_reverse_bcd(str(num), 9)
+    body[i + 20:i + 20 + len(obj_bytes)] = obj_bytes
 
-    greb_bytes = _encode_reverse_bcd(str(28 + (seed % 4)), 3)
-    body[i + 64:i + 64 + len(greb_bytes)] = greb_bytes
+    body[i + 30] = (seed % 2) & 0xFF        # сторона: 0=Левая, 1=Правая
+    body[i + 31] = ((seed % 3) + 1) & 0xFF  # шейка: 1/2/3
 
-    body[i + 67] = 0x01 if (seed % 4) == 0 else 0x00   # наплавка
+    # Обод @ i+32..33 (LE16, десятые мм) — напр. 750 = 75.0 мм
+    obod_val = (75 - (seed % 10)) * 10
+    body[i + 32] = obod_val & 0xFF
+    body[i + 33] = (obod_val >> 8) & 0xFF
+
+    # Обточка @ i+34 (u8, категория)
+    body[i + 34] = (2 + (seed % 5)) & 0xFF
+
+    # Гребень @ i+35..36 (LE16, десятые мм) — напр. 280 = 28.0 мм
+    greben_val = (28 + (seed % 4)) * 10
+    body[i + 35] = greben_val & 0xFF
+    body[i + 36] = (greben_val >> 8) & 0xFF
+
+    # Наплавка @ i+37
+    body[i + 37] = 0x01 if (seed % 4) == 0 else 0x00
 
     head = b"\x00\x01"  # маркер не-пустого блока (любые 2 байта кроме 0xFD/0xFF FF/FF)
     return addr, bytes(head + body)
@@ -4469,6 +4498,10 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
                 lambda r, c: self._on_ud2_open_report(r))
             self.ud2_table_settings.cellDoubleClicked.connect(
                 lambda r, c: self._on_ud2_open_protocol(r, settings=True))
+            # Одинарный клик (выделение строки) по протоколу → рисуем A-scan
+            # в правой панели без переключения вкладки (как у fdb_table).
+            self.ud2_table_protocols.itemSelectionChanged.connect(
+                self._on_ud2_protocol_selection_changed)
 
             # Внутренний QTabWidget с тремя под-вкладками.
             self.ud2_subtabs = QTabWidget(self)
@@ -5518,6 +5551,40 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
             if br is None:
                 return (None, "")
             return (bytes(br.block), "")
+
+        def _on_ud2_protocol_selection_changed(self):
+            """Одинарный клик (выделение строки) в «Протоколы (А-развёртка)» →
+            подгружаем BLOCKZAP, разбираем TLV, рисуем A-/B-scan в правой
+            панели БЕЗ переключения активной вкладки."""
+            rows = self.ud2_table_protocols.selectionModel().selectedRows()
+            if not rows:
+                return
+            row = rows[0].row()
+            meta = self._ud2_row_meta(self.ud2_table_protocols, row)
+            if meta is None:
+                return
+            block, firmware = self._load_blockzap_for_row(meta)
+            if block is None:
+                self._show_records([], raw_block=None)
+                try:
+                    self.ascan.set_zone_label("",
+                        f"NUMKOD={meta.get('num_kod')} не найден в BLOCKZAP")
+                except Exception:
+                    pass
+                return
+            try:
+                recs = decode_all(list(parse_tlv(block)), firmware)
+            except Exception:
+                recs = []
+            self._show_records(recs, raw_block=block)
+            # Подпись зоны.
+            try:
+                obj = (meta.get("num_obj") or "").strip()
+                cdf = (meta.get("code_def") or "").strip()
+                ext = " / ".join(x for x in (obj, f"код {cdf}" if cdf else "") if x)
+                self.ascan.set_zone_label("", ext)
+            except Exception:
+                pass
 
         def _on_ud2_open_protocol(self, row: int, *, settings: bool = False):
             """Двойной клик по протоколу/настройке → подгружаем BLOCKZAP,
