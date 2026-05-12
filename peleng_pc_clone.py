@@ -763,42 +763,154 @@ def _decode_time(data: bytes, offset: int) -> str:
 
 
 def _decode_ascan_fields(body: bytes) -> dict:
-    """Декодирование полей A-scan записи"""
+    """
+    Декодирование полей A-scan записи (категории 20-29).
+    
+    Из реверса DLL (DecodeShortProtocol @ 0x403420):
+    - Схема полей берётся из DAL_FIELDS_RESULTS (pick_results_schema по firmware)
+    - Поля: NUMBER, TYPEZAP, NUMKOD, DATEFORM, TIMEFORM, KODOPERA,
+      NAMEOPERA, NUMVERS, NUMPRIB, TYPEVAR, NUMOBJ, M, MM, CLOCK,
+      SMELTING, MAKETIME, DEFEKT, CODEDEF, CONDLENGTH, NUMZAP
+    - Типы: INT16(big-endian BCD), BCD-DATE(3 bytes: dd,mm,yy+2000),
+      BCD-TIME(2 bytes: hh,mm), STRING(Pascal len-prefixed CP1251),
+      ENUM(1 byte), BLOB(len16+data)
+    """
     fields = {}
-    if len(body) >= 10:
-        fields['date'] = _decode_date(body, 7)
-        fields['time'] = _decode_time(body, 10)
+    if len(body) < 5:
+        return fields
+    
+    # Дата: 3 байта [day][month][year-2000] начиная с offset 7
+    fields['date'] = _decode_date(body, 7)
+    fields['time'] = _decode_time(body, 10)
+    
+    # Номер записи (INT16 BE/LE зависит от прошивки)
+    if len(body) >= 4:
+        fields['number'] = body[1] | (body[2] << 8)
+    
+    # Тип записи
+    if len(body) >= 2:
+        fields['type_zap'] = body[0]  # 0=A-scan, 1=B-scan, 2=Settings, 3=Report
+    
+    # Оператор (Pascal string начинается с offset ~12-15)
+    if len(body) >= 20:
+        op_offset = 12
+        op_len = body[op_offset] if op_offset < len(body) else 0
+        if 0 < op_len < 32 and op_offset + 1 + op_len <= len(body):
+            try:
+                fields['operator'] = body[op_offset+1:op_offset+1+op_len].decode('cp1251', errors='replace')
+            except:
+                pass
+    
+    # A-scan данные (массив амплитуд 0..255) — в конце блока как BLOB
+    # Параметры: АЦП 50 МГц, амплитуда линейная 0-100% = 0-26 дБ
+    # Скорость УЗ в стали: 5900 м/с = 5.9 мм/мкс
+    fields['adc_rate_mhz'] = 50.0
+    fields['velocity_mm_us'] = 5.9
+    
     return fields
 
 
 def _decode_bscan_fields(body: bytes) -> dict:
-    """Декодирование полей B-scan записи"""
+    """
+    Декодирование полей B-scan записи (категории 10-19).
+    
+    Из реверса DLL (DecodeBscan @ 0x4031DC):
+    - B-scan = развёртка по глубине × координата сканирования
+    - Ось X: координата сканирования (мм)
+    - Ось Y: глубина (мм, скорость УЗ 5900 м/с)
+    - Цвет: амплитуда в дБ (byte 0-255 → 0-26 дБ)
+    
+    Формат данных B-scan в пакете:
+    - body[0:448] = заголовок A-scan (0x1C0 байт)
+    - body[448:] = битовая карта B-scan
+    - Строка = 30 байт = 240 бит (1 бит = 1 пиксель)
+    """
     fields = {}
-    if len(body) >= 10:
-        fields['date'] = _decode_date(body, 7)
-        fields['time'] = _decode_time(body, 10)
-        # B-scan данные начинаются с offset 0x1D0 - 0x10 = 0x1C0 от начала body
-        if len(body) > BSCAN_HEADER_SIZE:
-            fields['bscan_data_size'] = len(body) - BSCAN_HEADER_SIZE
-            fields['bscan_rows'] = (len(body) - BSCAN_HEADER_SIZE) // BSCAN_ROW_BYTES
+    if len(body) < 5:
+        return fields
+    
+    fields['date'] = _decode_date(body, 7)
+    fields['time'] = _decode_time(body, 10)
+    
+    # B-scan данные
+    if len(body) > BSCAN_HEADER_SIZE:
+        bscan_data = body[BSCAN_HEADER_SIZE:]
+        fields['bscan_data_size'] = len(bscan_data)
+        fields['bscan_rows'] = len(bscan_data) // BSCAN_ROW_BYTES
+        fields['bscan_width_bits'] = BSCAN_ROW_BYTES * 8  # 240
+        fields['bscan_width_px'] = BSCAN_ROW_BYTES * 8 * BSCAN_PIXEL_SCALE  # 480
+    
     return fields
 
 
 def _decode_generic_fields(body: bytes) -> dict:
-    """Декодирование полей Generic/Settings записи"""
+    """
+    Декодирование полей Generic/Settings записи (категории 4, 5, 6).
+    
+    Из реверса DLL:
+    - Категория 4/6 (DecodeGeneric @ 0x402C8C): общие настройки
+    - Категория 5 (DecodeCalibration @ 0x402F34): калибровка
+    
+    Настройки содержат УЗ-параметры:
+    - Усиление (дБ)
+    - Скорость УЗ-волны в материале (м/с)
+    - Угол ввода (градусы)
+    - Начало/ширина строба (дискрет АЦП)
+    - Порог срабатывания (%)
+    - Требуемая/фактическая чувствительность (дБ)
+    - Уровень отсечки шумов (%)
+    
+    Схема полей: DAL_FIELDS_NASTR1 из PelengPCtest.dal:
+      NUMBER, NUMKOD, TYPEZAP, DATEFORM, TIMEFORM, KODOPERA,
+      NAMEOPERA, NUMVERS, NUMPRIB, TYPEVAR, NUMPROT
+    """
     fields = {}
-    if len(body) >= 10:
-        fields['date'] = _decode_date(body, 7)
-        fields['time'] = _decode_time(body, 10)
+    if len(body) < 5:
+        return fields
+    
+    fields['date'] = _decode_date(body, 7)
+    fields['time'] = _decode_time(body, 10)
+    
+    # Типовой вариант (TYPEVAR) — определяет конфигурацию прибора
+    # Из реверса DispatchByTypeVar @ 0x4022C8:
+    # TypeVar 150-151: A-scan формат
+    # TypeVar 362-363, 380-381: общие
+    # TypeVar 390-391, 442-443, 480-481: composite
+    # TypeVar 642-643, 680-683, 712-713: B-scan
+    # TypeVar 730-731, 740-741, 780-781, 842-843: специальные
+    if len(body) >= 20:
+        # Пытаемся извлечь TypeVar из тела (обычно на фиксированном смещении)
+        fields['type_var_raw'] = body[18] | (body[19] << 8) if len(body) > 19 else 0
+    
     return fields
 
 
 def _decode_short_proto_fields(body: bytes) -> dict:
-    """Декодирование полей Short Protocol записи"""
+    """
+    Декодирование полей Short Protocol записи (категории 20-29).
+    
+    Из реверса DLL (DecodeShortProtocol @ 0x403420 → body[0]=4):
+    Схема DAL_FIELDS_SHORTPROT1:
+      NUMBER, NUMKOD, DATEFORM, TIMEFORM, KODOPERA, NAMEOPERA,
+      NUMVERS, NUMPRIB, TYPEVAR, NUMOBJ, M, MM, CLOCK,
+      NUMDEF, PROTOCOL(BLOB), NUMPROT
+    
+    Содержит краткий отчёт контроля:
+    - Номер объекта, координаты (м, мм)
+    - Количество дефектов
+    - Протокол (BLOB — бинарные данные отчёта)
+    """
     fields = {}
-    if len(body) >= 10:
-        fields['date'] = _decode_date(body, 7)
-        fields['time'] = _decode_time(body, 10)
+    if len(body) < 5:
+        return fields
+    
+    fields['date'] = _decode_date(body, 7)
+    fields['time'] = _decode_time(body, 10)
+    
+    # Извлечение ключевых полей протокола
+    if len(body) >= 15:
+        fields['num_obj'] = body[12] | (body[13] << 8) if len(body) > 13 else 0
+    
     return fields
 
 
@@ -1479,10 +1591,14 @@ def main():
     elif args.command == 'info':
         return cli_info(args)
     elif args.command == 'gui':
-        print("[*] GUI запуск... (PyQt6 required)")
-        print("[!] GUI будет добавлен в следующей версии")
-        print("    Используйте CLI команды: test, block, flash, info")
-        return 0
+        try:
+            from peleng_gui import run_gui
+            return run_gui(port=args.port, demo=args.demo)
+        except ImportError as e:
+            print(f"[!] GUI недоступен: {e}")
+            print("    Установите: pip install PyQt6")
+            print("    Или используйте CLI: test, block, flash, info")
+            return 1
     else:
         parser.print_help()
         return 0
