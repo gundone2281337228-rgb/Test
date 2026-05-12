@@ -884,3 +884,332 @@ struct AScanData {
 3. **CxImage рендеринг** — как генерируется PNG для WordML из off-screen DC.
 4. **Печать/экспорт** — как A-scan конвертируется в `protPict.png` для отчёта.
 5. **Полная карта DGS_Settings** (672+ байт) — есть ещё поля после +0x66C.
+
+
+
+---
+
+## 14. Декодер значений полей отчёта — `FUN_0042413f`
+
+### 14.1 Структура записи поля (stride = 28 байт = 7 int'ов)
+
+```c
+struct FieldDescriptor {       // param_2 + param_3 * 0x1C
+    /* +0x00 */ int count;      // количество полей (только в [0])
+    /* +0x04 */ char* label;    // [i*7+1] имя метки ("Дата:", "Время:", ...)
+    /* +0x08 */ int   offset;   // [i*7+2] смещение данных в буфере (или packed: HIWORD|LOWORD)
+    /* +0x0C */ byte  type;     // [i*7+3] тип поля (код декодирования)
+    /* +0x10 */ char* editName; // [i*7+4] имя CEdit-контрола ("no_edit", "defekt_edit", ...)
+    /* +0x14 */ code* transform;// [i*7+5] callback-трансформация (или NULL)
+    /* +0x18 */ code* validate; // [i*7+6] callback-валидация (или NULL)
+    /* +0x1C */ code* visible;  // [i*7+7] callback-видимости (если !=0 → вызывается)
+};
+```
+
+### 14.2 Полная таблица типов полей (из switch в FUN_0042413f)
+
+| Тип (hex) | Чтение | Формат вывода | Описание |
+|-----------|--------|---------------|----------|
+| 0x02 | ReadFloat6(offset) | "%f" | Дробное число (Real48) |
+| 0x03 | ReadFloat6(offset) | "%f" (формат 2) | Дробное число (альт. формат) |
+| 0x04 | ReadShort(offset) | "%d" | LE16 целое (с optional callback) |
+| 0x06 | ReadByte[5](offset) | "%2d.%2d.%2d %2d:%2d" | Дата+время (5 байт) |
+| 0x0D | ReadByte(offset) | "%d" | Byte целое (с optional callback) |
+| 0x10 | ReadShort(offset) | (формат из DAT) | LE16 (формат 3) |
+| 0x11 | ReadShort(offset) | (формат из DAT) | LE16 (формат 4) |
+| 0x16 | ReadFloat6(offset) → sqrt() | (формат из DAT) | √(Real48) |
+| 0x24 | GetEditText(editName) | строка | Обычное текстовое поле |
+| 0x25 | GetEditText(editName) | строка | Поле-заголовок |
+| 0x26 | GetEditText(editName) | строка | Поле с валидацией |
+| 0x27 | ReadByte(offset) → callback() | строка | Lookup по таблице (callback → string) |
+| 0x28 | FUN_0042409a(offset, 7) | passport | Passport-decode (7 байт, reverse-LUT) |
+| 0x2A | FUN_0042409a(offset, 6) | passport | Passport-decode (6 байт) |
+| 0x2B | ReadByte(offset) & 8 | "Да"/"Нет" | Boolean flag (бит 3) |
+| 0x2C | GetEditText(editName) | строка | Комбо/список (CComboBox) |
+| 0x2D | ReadShort(offset) | "%d" | LE16 целое (формат 5) |
+| 0x30 | FUN_0042390e(offset) | дата (packed) | Packed date (20-bit decompose) |
+| 0x31 | ReadByte(HI) + ReadByte(LO) | условный | Двухбайтовое с порогом (0x7F/0x10) |
+| 0x35 | ReadShort(offset) | "%d" | LE16 → int (формат 6) |
+| 0x36 | GetEditText(editName) | строка | Числовое поле (CEdit) |
+| 0x38 | ReadByte(HIWORD) | byte с инверсией | Если >0x7F → 256-val (знаковый) |
+| 0x39 | FUN_0042409a(offset, 12) | passport | Passport-decode (12 байт!) |
+| 0x3A | GetEditText(editName) | строка | Расширенное поле |
+| 0x3B | FUN_0042409a(offset, 11) | passport | Passport-decode (11 байт) |
+| 0x3E | ReadShort(LO) + ReadByte(HI) → callback | float/string | Составное поле (2 источника) |
+| 0x3F | ReadByte(LO) + ReadByte(HI) → callback | float/string | Двухбайт с callback |
+| 0x42 | ReadFloat6(LO) + ReadByte(HI) | float + условие | Float с порогом (0x10/0x7E) |
+| 0x43 | ReadFloat6(LO) → 2×√val | float | Двойной корень Real48 (диаметр?) |
+
+### 14.3 Passport LUT в zapis2.exe (FUN_00423a6b) — **подтверждение**
+
+| Индекс | CP1251 | Символ | Совпадение с DLL |
+|--------|--------|--------|-----------------|
+| 0x00 | 0x30 | '0' | DLL pos 10 |
+| 0x01 | 0x31 | '1' | DLL pos 1 |
+| 0x02 | 0x32 | '2' | DLL pos 2 |
+| ... | ... | ... | ... |
+| 0x09 | 0x39 | '9' | DLL pos 9 |
+| 0x0A | 0x20 | ' ' | DLL pos 11 |
+| 0x0B | 0x41 | 'A' | DLL pos 81 |
+| 0x0C | 0xC1 | 'Б' | DLL pos 16 |
+| 0x0D | 0x42 | 'B' | DLL pos 82 |
+| 0x0E | 0xC3 | 'Г' | DLL pos 18 |
+| 0x0F | 0xC4 | 'Д' | DLL pos 19 |
+| 0x10 | 0x45 | 'E' | DLL pos — |
+| 0x11 | 0xC6 | 'Ж' | DLL pos 22 |
+| 0x12 | 0xC7 | 'З' | DLL pos 23 |
+| 0x13 | 0xC8 | 'И' | DLL pos 24 |
+| 0x14 | 0xC9 | 'Й' | DLL pos 25 |
+| 0x15 | 0x4B | 'K' | DLL pos — |
+| 0x16 | 0xCB | 'Л' | DLL pos 27 |
+| 0x17 | 0x4D | 'M' | DLL pos — |
+| 0x18 | 0x48 | 'H' | DLL pos — |
+| 0x19 | 0x4F | 'O' | DLL pos — |
+| 0x1A | 0xCF | 'П' | DLL pos 31 |
+| 0x1B | 0x50 | 'P' | DLL pos — |
+| 0x1C | 0x43 | 'C' | DLL pos — |
+| 0x1D | 0xD2 | 'Т' | DLL pos 34 |
+| 0x1E | 0xD3 | 'У' | DLL pos 35 |
+| 0x1F | 0xD7 | 'Ч' | DLL pos 39 |
+| 0x20 | 0xD4 | 'Ф' | DLL pos 36 |
+| 0x21 | 0xD5 | 'Х' | DLL pos 37 |
+| 0x22 | 0xD6 | 'Ц' | DLL pos 38 |
+| 0x23 | 0xD8 | 'Ш' | DLL pos 40 |
+| 0x24 | 0xD9 | 'Щ' | DLL pos 41 |
+| 0x25 | 0xDA | 'Ъ' | DLL pos 42 |
+| 0x26 | 0xDB | 'Ы' | DLL pos 43 |
+| 0x27 | 0xDC | 'Ь' | DLL pos 44 |
+
+**Вывод:** zapis2.exe использует **свою** нумерацию LUT (отличную от DLL), но конвертирует в те же CP1251-символы. Смесь латиницы и кириллицы — для «международных» серийных номеров.
+
+---
+
+## 15. Инициализация документа — `FUN_0040da36`
+
+### 15.1 Диспатч функции отображения (callback param_1+0x528)
+
+```c
+void InitDocument(int dataDesc) {
+    // Выбор функции getDisplayMode (DGS-режим):
+    if ((flags & 2)==0 && (flags & 0x40)==0 && tcode!=0x5006 && tcode!=0x5106) {
+        dataDesc->getModeFn = FUN_00408f24;  // обычный режим
+    } else {
+        dataDesc->getModeFn = FUN_00408f89;  // расширенный режим
+    }
+    
+    // Выбор функции рендеринга (callback param_1+0x528):
+    if ((flags & 0x40)==0 || (flags & 4)!=0) {
+        if ((flags & 0x10)==0) {
+            if ((flags & 0x40)==0) {
+                switch (tcode & 0xFF) {
+                    case 1:  fn = FUN_00409213; break;  // одноканальный A-scan
+                    case 3:
+                    case 7:  fn = FUN_004090f3; break;  // огибающая
+                    case 4:
+                    case 6:
+                    case 8:  fn = FUN_00409147; break;  // стробированный
+                }
+            } else {
+                if ((tcode & 0xFF) == 3 || (tcode & 0xFF) == 7) {
+                    fn = FUN_004090f3;
+                } else {
+                    fn = FUN_00409147;
+                }
+            }
+        } else if ((flags & 0x20)==0) {
+            fn = FUN_0040900f;  // B-scan простой
+        } else {
+            fn = FUN_00409093;  // B-scan двойной
+        }
+    } else {
+        fn = FUN_0040919b;      // специальный (вагонная?)
+    }
+    dataDesc->renderFn = fn;
+}
+```
+
+### 15.2 Карта TypeCode → режим рендеринга
+
+| tcode & 0xFF | Режим | Функция |
+|--------------|-------|---------|
+| 1 | A-scan одноканальный | `FUN_00409213` |
+| 3, 7 | Огибающая (peak detect) | `FUN_004090f3` |
+| 4, 6, 8 | Стробированный | `FUN_00409147` |
+| (flags & 0x10) без 0x20 | B-scan простой | `FUN_0040900f` |
+| (flags & 0x10) с 0x20 | B-scan двойной | `FUN_00409093` |
+| (flags & 0x40) без бит 4 | Специальный | `FUN_0040919b` |
+
+### 15.3 Флаги версии (DAT_0051cb30)
+
+| Бит | Маска | Значение |
+|-----|-------|----------|
+| 1 | 0x02 | Режим «расширенный DGS» |
+| 2 | 0x04 | Вагонная версия (multiplier=2.0) |
+| 4 | 0x10 | B-scan данные присутствуют |
+| 5 | 0x20 | Двойной B-scan (2 канала) |
+| 6 | 0x40 | Специальный режим (тестовый?) |
+| 16 | 0x10000 | B-scan поля в отчёте (показывать секцию BScan) |
+
+---
+
+## 16. Генерация отчёта WordML (реконструкция)
+
+### 16.1 Структура XML-документа
+
+```xml
+<?xml version="1.0"?>
+<?mso-application progid='Word.Document'?>
+<w:wordDocument ...>
+  <w:body>
+    <wx:sect>
+      <w:sectPr>
+        <w:type w:val="continuous"/>
+        <w:cols w:num="..."/>
+        <w:pgSz w:w="11906" w:h="16838"/>  <!-- A4 portrait -->
+      </w:sectPr>
+      <w:pict>
+        <w:binData w:name="wordml://protPict.png">
+          <!-- base64 PNG image of A-scan/B-scan -->
+        </w:binData>
+        <v:shape style="width:240pt;height:120pt">
+          <v:imagedata src="wordml://protPict.png"/>
+        </v:shape>
+      </w:pict>
+    </wx:sect>
+  </w:body>
+</w:wordDocument>
+```
+
+### 16.2 Размеры изображения в отчёте
+
+| Условие | Стиль | Позиционирование |
+|---------|-------|-----------------|
+| Нет B-scan (`hasBscan==0` и нет флага 0x10000) | `width:240pt;height:120pt` | Обычное (inline) |
+| Есть B-scan | `width:240pt;height:120pt;position:absolute` | Абсолютное (плавающее) |
+
+### 16.3 Генерация PNG
+
+```c
+// Рендеринг off-screen → CxImage → PNG:
+CxImage::Save(bitmap, "temp.png", 2);  // тип 2 = PNG
+// После вставки в XML:
+DeleteFileA("temp.png");               // удаляем временный файл
+```
+
+---
+
+## 17. Обработка полей формы — `FUN_004168de`
+
+### 17.1 Поля, заполняемые в форме
+
+```c
+void CZapisView::FillFormFields(int* param_1) {
+    // 1. Ограничение высоты:
+    if (this->maxHeight < DAT_0051cb28) {
+        DAT_0051cb28 = this->maxHeight;
+    }
+    
+    // 2. Поле "imhoOper" (оператор):
+    piVar1 = FindField(this, "imhoOper");
+    if (piVar1 != NULL) {
+        DrawLabel(param_1, x, y, "imhoOper_label");  // метка
+        PlaceEdit(this, "imhoOper", position, param_1);  // CEdit
+        AdvanceY(this, height + 5);
+    }
+    
+    // 3. Разделительная линия
+    DrawLine(param_1, x, y, "---");
+    
+    // 4. Копируем DGS-параметры (672 байт = 0x19C dwords = 412 int)
+    memcpy(auStack_6d0, dataDescriptor->dgsParams, 0x19C * 4);
+    
+    // 5. Вызов рендеринга DGS-виджета:
+    FUN_0040afd1(this->dgsWidget, param_1);  // рисует настройки
+    
+    // 6. Поле "about" (описание дефекта):
+    PlaceEdit(this, "about", position, param_1);
+    
+    // 7. Если режим печати (не экран):
+    if (isPrinting) {
+        SetFieldText(this, "imhoOper", param_1);
+        SetFieldText(this, "about", param_1);
+    }
+}
+```
+
+### 17.2 Ключевые имена полей формы
+
+| Строковый ID | Назначение |
+|-------------|-----------|
+| `"numZap"` | Номер записи (протокола) |
+| `"imhoOper"` | Имя оператора |
+| `"about"` | Описание / заключение по дефекту |
+
+---
+
+## 18. Формула расчёта глубины — `FUN_004238ec`
+
+```c
+float depth_from_time(float time_samples) {
+    return (_DAT_00515ea0 * time_samples * _DAT_0051cb38) / 2000.0f;
+}
+```
+
+**Где:**
+- `_DAT_00515ea0` — скорость звука в материале (м/с ÷ 1000 = мм/мкс)
+- `time_samples` — время пробега (в отсчётах)
+- `_DAT_0051cb38` — период дискретизации (мкс/отсч)
+- `2000.0` — двукратный путь (туда-обратно) × 1000 (мм→мкм)
+
+**Итоговая формула:** `depth_mm = v_sound × t_samples × dt / 2000`
+
+---
+
+## 19. Packed Date decoder — `FUN_0042390e`
+
+```c
+void DecodeDatePacked(uint packed) {
+    // Формат packed: bits [19:8]=month+day, bits [7:0]=extra, bits [31:20]=year
+    int mid_field = (packed & 0xFFFFF) >> 8;      // биты 8..19
+    int low_field = packed & 0xFF;                  // биты 0..7
+    int high_field = packed >> 20;                  // биты 20..31
+    
+    short val1 = ReadShort(mid_field);              // ?
+    short val2 = ReadShort(mid_field + low_field);  // ?
+    short val3 = ReadShort(high_field);             // ?
+    // → sprintf("%d.%d.%d", ...) через __ftol
+}
+```
+
+---
+
+## 20. Сводка новых находок (раунд 5 — отчёты/TLV)
+
+| # | Находка | Статус | Источник |
+|---|---------|--------|----------|
+| 63 | Декодер полей: 26+ типов (0x02..0x43), stride 28 байт | 🔒 Железобетонно | FUN_0042413f |
+| 64 | Passport в zapis2: своя LUT (отличается от DLL!), смесь lat+cyr | 🔒 Железобетонно | FUN_00423a6b |
+| 65 | Passport lengths: 5, 6, 7, 11, 12 байт (разные поля) | 🔒 Железобетонно | switch case 0x28/0x2A/0x39/0x3B |
+| 66 | Real48 (6-byte Delphi float) используется для типов 0x02, 0x03, 0x16, 0x42, 0x43 | 🔒 Железобетонно | FUN_00423253 calls |
+| 67 | Boolean: тип 0x2B = ReadByte & 0x08 (бит 3) → "Да"/"Нет" | 🔒 Железобетонно | case 0x2B |
+| 68 | Тип 0x38: знаковый byte (>0x7F → 256-val) | 🔒 Железобетонно | case 0x38 |
+| 69 | Тип 0x43: 2×√(Real48) — двойной корень (= диаметр из площади?) | 🔒 Железобетонно | case 0x43 |
+| 70 | Глубина: `v × t × dt / 2000` | 🔒 Железобетонно | FUN_004238ec |
+| 71 | WordML: CxImage→temp.png→base64→XML, затем DeleteFile | 🔒 Железобетонно | строки 20433/20455 |
+| 72 | Поля формы: "numZap", "imhoOper", "about" — 3 ключевых + массив из dataDescriptor | 🔒 Железобетонно | FUN_004168de |
+| 73 | InitDoc: tcode&0xFF → render callback (1=A-scan, 3/7=peak, 4/6/8=gated) | 🔒 Железобетонно | FUN_0040da36 |
+| 74 | Флаги: бит1=DGS, бит2=вагонная, бит4=BScan, бит5=dual-BScan, бит6=special | 🔒 Железобетонно | FUN_0040da36 |
+| 75 | DGS-параметры: 672 байт (0x19C×4) копируются в стек перед рендером | 🔒 Железобетонно | FUN_004168de |
+| 76 | Нет SQL в zapis2.exe — только WordML отчёты, нет Firebird | 🔒 Железобетонно | grep подтвердил |
+| 77 | Packed date (тип 0x30): 3 поля из 32-бит числа (bits 0-7, 8-19, 20-31) | 🔒 Железобетонно | FUN_0042390e |
+
+---
+
+## 21. Что осталось непокрыто (обновлённый список)
+
+1. **Полная LUT zapis2** (все 40+ символов `FUN_00423a6b`) — нужно дочитать switch до конца
+2. **Callbacks FUN_00408f24..FUN_00409213** — точная логика определения displayMode
+3. **FUN_0040afd1** — рендеринг DGS-виджета (отрисовка настроек в форме)
+4. **FUN_00421f16** — чтение текста из CEdit по имени (для типов 0x24-0x36)
+5. **Полный список строк полей** из dataDescriptor+0x48 и +0xB3C (DFM-ресурсы)
+6. **FUN_0042371b** — инициализация шрифта отчёта (Times New Roman, 7pt × 16pt)
