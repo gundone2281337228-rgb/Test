@@ -398,6 +398,7 @@ class PortConfig:
     timeout_ms:     int = 10000        # суммарный «жёсткий» таймаут на ВСЁ чтение
     idle_ms:        int = 2000         # idle-таймаут между байтами (сбрасывается на каждом байте)
     inter_byte_ms:  int = 10           # пауза между байтами команды (Sleep(10) из оригинала)
+    auto_baud:      bool = True        # перебирать DEFAULT_BAUDS при хэндшейке
     debug:          bool = False       # печатать байтовые TX/RX события
 
     def to_pyserial_kwargs(self) -> dict:
@@ -4032,7 +4033,7 @@ def _import_pyqt():
     from PyQt6.QtCore import QObject, QRect, Qt, QThread, pyqtSignal
     from PyQt6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen
     from PyQt6.QtWidgets import (
-        QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+        QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
         QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
         QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
         QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
@@ -4047,7 +4048,8 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
     QThread = qt["QThread"]; pyqtSignal = qt["pyqtSignal"]
     QAction = qt["QAction"]; QColor = qt["QColor"]; QFont = qt["QFont"]
     QImage = qt["QImage"]; QPainter = qt["QPainter"]; QPen = qt["QPen"]
-    QApplication = qt["QApplication"]; QComboBox = qt["QComboBox"]
+    QApplication = qt["QApplication"]; QCheckBox = qt["QCheckBox"]
+    QComboBox = qt["QComboBox"]
     QDialog = qt["QDialog"]; QDialogButtonBox = qt["QDialogButtonBox"]
     QFileDialog = qt["QFileDialog"]; QFormLayout = qt["QFormLayout"]
     QHBoxLayout = qt["QHBoxLayout"]; QHeaderView = qt["QHeaderView"]
@@ -4303,6 +4305,13 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
                 self.baud_combo.addItem(str(b), b)
             idx = list(DEFAULT_BAUDS).index(self._cfg.baud) if self._cfg.baud in DEFAULT_BAUDS else 4
             self.baud_combo.setCurrentIndex(idx)
+            self.auto_baud_cb = QCheckBox("Автоподбор скорости (перебор всех)", self)
+            self.auto_baud_cb.setChecked(self._cfg.auto_baud)
+            self.auto_baud_cb.setToolTip(
+                "При включённом автоподборе программа перебирает все 8 скоростей\n"
+                "(сначала выбранную, затем остальные от 115200 до 1200),\n"
+                "посылая 'U'-хэндшейк на каждой. Это занимает до 30 секунд,\n"
+                "но гарантирует связь с прибором без угадывания скорости.")
             self.timeout_spin = QSpinBox(self)
             self.timeout_spin.setRange(500, 600000); self.timeout_spin.setSingleStep(500)
             self.timeout_spin.setSuffix(" мс"); self.timeout_spin.setValue(self._cfg.timeout_ms)
@@ -4315,13 +4324,16 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
             form = QFormLayout()
             form.addRow("Порт:", self.port_combo)
             form.addRow("Скорость:", self.baud_combo)
+            form.addRow("", self.auto_baud_cb)
             form.addRow("Полный таймаут:", self.timeout_spin)
             form.addRow("Idle-таймаут:",   self.idle_spin)
             form.addRow("Пауза между байтами:", self.ib_spin)
             note = QLabel(
                 "Если приходит мало байт «получено N из M» —\n"
                 "увеличивайте «Полный таймаут» и «Idle-таймаут».\n"
-                "На медленных приборах ставьте 30000/5000.", self)
+                "На медленных приборах ставьте 30000/5000.\n\n"
+                "«Автоподбор скорости» — перебирает 8 baud rates\n"
+                "(как оригинальный PelengPC.exe при первом подключении).", self)
             note.setStyleSheet("color: #888; font-size: 11px;")
             bb = QDialogButtonBox(
                 QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -4337,6 +4349,7 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
                 timeout_ms=int(self.timeout_spin.value()),
                 idle_ms=int(self.idle_spin.value()),
                 inter_byte_ms=int(self.ib_spin.value()),
+                auto_baud=self.auto_baud_cb.isChecked(),
                 debug=self._cfg.debug,
             )
 
@@ -4395,38 +4408,159 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
         received = pyqtSignal(bytes, object)
         failed   = pyqtSignal(str)
         done     = pyqtSignal()
+        baud_found = pyqtSignal(int)      # сигнал: найдена рабочая скорость
 
         def __init__(self, cfg):
             super().__init__(); self.cfg = cfg
 
+        def _try_handshake(self, port: PelengPort) -> ProtocolHeader | None:
+            """Одна попытка handshake (4× 'U' с паузой 100 мс, как TestPort
+            @ 0x004249c0). Возвращает заголовок или None при таймауте."""
+            # Оригинал шлёт 0x55 и ждёт 16 байт. Мы делаем 4 попытки
+            # (аналог 4× 0x55 из УД2-хэндшейка — даёт прибору время
+            # на выход из sleep/autobaud).
+            for attempt in range(4):
+                try:
+                    hdr = port.test_port()
+                    if hdr.payload_len >= 0:
+                        return hdr
+                except PelengError:
+                    pass
+                time.sleep(0.100)
+            return None
+
+        def _auto_baud(self) -> tuple[PelengPort, ProtocolHeader]:
+            """Перебираем DEFAULT_BAUDS, на каждой скорости пытаемся
+            handshake. Возвращает (открытый PelengPort, заголовок).
+
+            Алгоритм реконструирован из реверса PelengPC.exe:
+            - TestPort_handshake @ 0x004249c0 отправляет 0x55 → 16 байт
+            - В оригинале цикл по baud rates вынесен в GUI (пользователь
+              выбирает), здесь мы автоматизируем подбор.
+            - Порядок: сначала текущая cfg.baud, затем остальные от высокой
+              к низкой (115200 → 1200) — для минимального времени ожидания.
+            """
+            # Формируем список скоростей: сначала текущая, потом остальные
+            bauds_to_try = [self.cfg.baud]
+            for b in reversed(DEFAULT_BAUDS):
+                if b != self.cfg.baud:
+                    bauds_to_try.append(b)
+
+            last_err = ""
+            for i, baud in enumerate(bauds_to_try):
+                self.progress.emit(
+                    5 + i * 10, 100,
+                    f"Подбор скорости: {baud} бод ({i+1}/{len(bauds_to_try)})…")
+                cfg_try = PortConfig(
+                    name=self.cfg.name,
+                    baud=baud,
+                    timeout_ms=min(self.cfg.timeout_ms, 3000),  # короткий таймаут для подбора
+                    idle_ms=min(self.cfg.idle_ms, 1000),
+                    inter_byte_ms=self.cfg.inter_byte_ms,
+                    auto_baud=False,
+                    debug=self.cfg.debug,
+                )
+                port = PelengPort(cfg_try)
+                try:
+                    port.open()
+                    hdr = self._try_handshake(port)
+                    if hdr is not None:
+                        self.baud_found.emit(baud)
+                        return port, hdr
+                    port.close()
+                except Exception as e:
+                    last_err = str(e)
+                    try:
+                        port.close()
+                    except Exception:
+                        pass
+
+            raise PelengError(
+                f"Автоподбор скорости: не удалось связаться с прибором "
+                f"ни на одной из {len(bauds_to_try)} скоростей "
+                f"({', '.join(str(b) for b in bauds_to_try)}). "
+                f"Проверьте: 1) кабель RS-232, 2) питание прибора, "
+                f"3) имя порта «{self.cfg.name}»."
+                + (f"\nПоследняя ошибка: {last_err}" if last_err else ""))
+
         def run(self):
             try:
-                with PelengPort(self.cfg) as port:
-                    self.progress.emit(10, 100, "Хэндшейк ('U')…")
-                    hdr = port.test_port()
-                    self.progress.emit(30, 100,
-                        f"Получен заголовок (record_id=0x{hdr.record_id:04x}, payload={hdr.payload_len})")
-                    if hdr.payload_len == 0:
-                        self.failed.emit("Прибор вернул payload_len=0 — нечего читать."); return
-                    total = HEADER_LEN + hdr.payload_len
-                    self.progress.emit(50, 100, f"Запрос блока ({total} байт)…")
+                if self.cfg.auto_baud:
+                    # --- Автоподбор скорости ---
+                    self.progress.emit(5, 100, "Автоподбор скорости…")
+                    port, hdr = self._auto_baud()
                     try:
-                        blob = port.request_block(total)
-                    except PelengError as ex:
-                        # Если у нас есть хоть какие-то частичные данные — попробуем
-                        # дешифровать что есть, чтобы пользователь увидел хотя бы часть.
-                        partial = getattr(ex, "partial", b"")
-                        if partial and len(partial) >= HEADER_LEN:
-                            self.progress.emit(80, 100,
-                                f"Тайм-аут, но удалось принять {len(partial)} из {total} байт — "
-                                f"показываю частичные данные.")
-                            self.received.emit(bytes(partial), hdr)
-                            self.failed.emit(str(ex))
+                        # Переоткрываем порт с полными таймаутами для приёма блока
+                        working_baud = port.cfg.baud
+                        port.close()
+                        full_cfg = PortConfig(
+                            name=self.cfg.name,
+                            baud=working_baud,
+                            timeout_ms=self.cfg.timeout_ms,
+                            idle_ms=self.cfg.idle_ms,
+                            inter_byte_ms=self.cfg.inter_byte_ms,
+                            auto_baud=False,
+                            debug=self.cfg.debug,
+                        )
+                        port = PelengPort(full_cfg)
+                        port.open()
+                        # Повторный handshake с нормальными таймаутами
+                        self.progress.emit(30, 100,
+                            f"Скорость {working_baud} бод — повторный хэндшейк…")
+                        hdr = port.test_port()
+                        self.progress.emit(40, 100,
+                            f"Получен заголовок @ {working_baud} бод "
+                            f"(record_id=0x{hdr.record_id:04x}, payload={hdr.payload_len})")
+                        if hdr.payload_len == 0:
+                            self.failed.emit(
+                                f"Прибор вернул payload_len=0 — нечего читать "
+                                f"(скорость {working_baud} бод).")
                             return
-                        raise
-                    self.progress.emit(95, 100, "Готово.")
-                    self.received.emit(blob, hdr)
-                    self.progress.emit(100, 100, "Готово.")
+                        total = HEADER_LEN + hdr.payload_len
+                        self.progress.emit(50, 100, f"Запрос блока ({total} байт)…")
+                        try:
+                            blob = port.request_block(total)
+                        except PelengError as ex:
+                            partial = getattr(ex, "partial", b"")
+                            if partial and len(partial) >= HEADER_LEN:
+                                self.progress.emit(80, 100,
+                                    f"Тайм-аут, но удалось принять {len(partial)} "
+                                    f"из {total} байт — показываю частичные данные.")
+                                self.received.emit(bytes(partial), hdr)
+                                self.failed.emit(str(ex))
+                                return
+                            raise
+                        self.progress.emit(95, 100, "Готово.")
+                        self.received.emit(blob, hdr)
+                        self.progress.emit(100, 100, "Готово.")
+                    finally:
+                        port.close()
+                else:
+                    # --- Фиксированная скорость (как раньше) ---
+                    with PelengPort(self.cfg) as port:
+                        self.progress.emit(10, 100, "Хэндшейк ('U')…")
+                        hdr = port.test_port()
+                        self.progress.emit(30, 100,
+                            f"Получен заголовок (record_id=0x{hdr.record_id:04x}, payload={hdr.payload_len})")
+                        if hdr.payload_len == 0:
+                            self.failed.emit("Прибор вернул payload_len=0 — нечего читать."); return
+                        total = HEADER_LEN + hdr.payload_len
+                        self.progress.emit(50, 100, f"Запрос блока ({total} байт)…")
+                        try:
+                            blob = port.request_block(total)
+                        except PelengError as ex:
+                            partial = getattr(ex, "partial", b"")
+                            if partial and len(partial) >= HEADER_LEN:
+                                self.progress.emit(80, 100,
+                                    f"Тайм-аут, но удалось принять {len(partial)} из {total} байт — "
+                                    f"показываю частичные данные.")
+                                self.received.emit(bytes(partial), hdr)
+                                self.failed.emit(str(ex))
+                                return
+                            raise
+                        self.progress.emit(95, 100, "Готово.")
+                        self.received.emit(blob, hdr)
+                        self.progress.emit(100, 100, "Готово.")
             except PelengError as e:
                 self.failed.emit(str(e))
             except Exception as e:
@@ -4770,8 +4904,9 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
                 f"  БД: {self._db_path}  ({self._db.count()} блоков, "
                 f"{ud2_n} Записей УД2)  ")
             ud2_extra = f" | УД2-102: № {self._device_no}" if self._device_no is not None else ""
+            auto_tag = " [авто]" if self._cfg.auto_baud else ""
             self._status_port.setText(
-                f"Порт: {self._cfg.name} @ {self._cfg.baud}{ud2_extra}  ")
+                f"Порт: {self._cfg.name} @ {self._cfg.baud}{auto_tag}{ud2_extra}  ")
 
         def _on_port_settings(self):
             dlg = PortDialog(self._cfg, self)
@@ -5015,9 +5150,25 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
             self._worker.progress.connect(self._on_recv_progress)
             self._worker.received.connect(self._on_recv_received)
             self._worker.failed.connect(self._on_recv_failed)
+            self._worker.baud_found.connect(self._on_baud_found)
             self._worker.done.connect(self._thread.quit)
             self._worker.done.connect(self._on_recv_done)
             self._thread.start(); self._progress.exec()
+
+        def _on_baud_found(self, baud: int):
+            """Обновляем cfg.baud, чтобы последующие операции использовали
+            найденную скорость (без повторного автоподбора)."""
+            if self._cfg.baud != baud:
+                self._cfg = PortConfig(
+                    name=self._cfg.name,
+                    baud=baud,
+                    timeout_ms=self._cfg.timeout_ms,
+                    idle_ms=self._cfg.idle_ms,
+                    inter_byte_ms=self._cfg.inter_byte_ms,
+                    auto_baud=self._cfg.auto_baud,
+                    debug=self._cfg.debug,
+                )
+                self._update_status_widgets()
 
         def _on_recv_progress(self, value, total, text):
             if self._progress: self._progress.set_progress(value, total, text)
@@ -5028,6 +5179,19 @@ def run_gui(argv: list[str], demo: bool = False) -> int:
             except Exception as e:
                 QMessageBox.warning(self, "БД", f"Не удалось записать блок: {e}")
             self._refresh_table(select_number=hdr.record_id)
+            # Автопереключение на самую релевантную вкладку после приёма:
+            # приоритет A-scan > B-scan > fields (как при двойном клике).
+            try:
+                firmware = hdr.firmware_version() if hdr else ""
+                recs = decode_all(list(parse_tlv(blob)), firmware)
+                a = next((r for r in recs if isinstance(r, AScanRecord)), None)
+                b = next((r for r in recs if isinstance(r, BScanRecord)), None)
+                if a is not None:
+                    self.tabs.setCurrentWidget(self.ascan)
+                elif b is not None:
+                    self.tabs.setCurrentWidget(self.bscan)
+            except Exception:
+                pass
 
         def _on_recv_failed(self, msg):
             QMessageBox.critical(self, "Ошибка приёма", msg)
