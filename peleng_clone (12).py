@@ -669,6 +669,206 @@ def reverse_bcd(buf: bytes, length: int | None = None) -> str:
 
 
 # =============================================================================
+# 1A-2. PASSPORT DECODER (реверс FUN_00402708 из 102_203dll.dll)
+# =============================================================================
+# DLL хранит 2 LUT-таблицы по 124 байта каждая (DAT_004284b4, DAT_00428530).
+# INPUT_TABLE[i] = сырой байт, который прибор записывает в поле паспорта.
+# OUTPUT_TABLE[i] = отображаемый символ.
+# Алгоритм: для каждого сырого байта (в ОБРАТНОМ порядке — от последнего к первому):
+#   1) Ищем байт в INPUT_TABLE → находим позицию i
+#   2) Выдаём OUTPUT_TABLE[i]
+#   3) Пропускаем ведущие NUL (позиция 0)
+#
+# Если INPUT_TABLE — identity (позиция == значение байта), то алгоритм
+# упрощается до прямого индексного lookup: OUTPUT_TABLE[raw_byte].
+#
+# Реконструированная таблица символов (124 позиции):
+PASSPORT_LUT: str = (
+    '\x00'                              # 0: NUL (terminator/skip)
+    '1234567890'                        # 1-10: digits (1@pos1 .. 9@pos9, 0@pos10)
+    ' .-/'                              # 11-14: space, dot, dash, slash
+    'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'  # 15-47: Cyrillic uppercase А-Я (33)
+    'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'  # 48-80: Cyrillic lowercase а-я (33)
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ'        # 81-106: Latin A-Z (26)
+    '0123456789+'                       # 107-117: alt digits + plus
+    '\x00\x00\x00\x00\x00\x00'         # 118-123: reserved/padding
+)
+assert len(PASSPORT_LUT) == 124, f"PASSPORT_LUT must be 124 chars, got {len(PASSPORT_LUT)}"
+
+
+def decode_passport_peleng(raw: bytes) -> str:
+    """Decode Peleng-format passport using 124-char substitution LUT.
+
+    Прибор PelengPC хранит паспорт/серийный номер как массив индексов (0-123).
+    Байты обрабатываются в ОБРАТНОМ порядке (от последнего к первому).
+    Ведущие нули (индекс 0 = NUL) пропускаются.
+
+    Используется в: _SortBufData → FUN_00402708
+    Поля пакета:  +0x11 (11 байт), +0x21 (7 байт), ShortProt +0x11 (6 байт)
+
+    Args:
+        raw: Сырые байты паспорта из пакета прибора
+    Returns:
+        Декодированная строка паспорта (цифры, буквы, символы)
+    """
+    result: list[str] = []
+    started = False
+    for i in range(len(raw) - 1, -1, -1):
+        idx = raw[i]
+        if idx >= len(PASSPORT_LUT):
+            continue  # out of range — skip
+        ch = PASSPORT_LUT[idx]
+        if ch == '\x00' and not started:
+            continue  # skip leading NULs
+        started = True
+        if ch == '\x00':
+            result.append(' ')  # embedded NUL → space
+        else:
+            result.append(ch)
+    return ''.join(result)
+
+
+def encode_passport_peleng(text: str, field_len: int = 11) -> bytes:
+    """Encode a passport string back to Peleng raw byte indices.
+
+    Обратная операция к decode_passport_peleng().
+    Результат дополняется нулями до field_len.
+
+    Args:
+        text: Строка паспорта для кодирования
+        field_len: Длина поля (11 для primary, 7 для secondary)
+    Returns:
+        Байты в «сыром» порядке хранения (reverse of display order)
+    """
+    indices: list[int] = []
+    for ch in reversed(text):
+        idx = PASSPORT_LUT.find(ch)
+        if idx == -1:
+            idx = 0  # unknown char → NUL
+        indices.append(idx)
+    # Pad with zeros to field_len
+    while len(indices) < field_len:
+        indices.append(0)
+    return bytes(indices[:field_len])
+
+
+# Карта полей тела пакета PelengPC (реконструкция из 102_203dll.dll)
+# Используется для декодирования записей A-scan, B-scan, Generic, ShortProt.
+PELENG_BODY_FIELDS: dict[str, tuple[int, int, str]] = {
+    # name:          (offset, size, type)
+    # type: 'le16'=LE16 число, 'lut'=passport LUT, 'date'=3-byte date, 'time'=2-byte time, 'flag'=byte
+    "device_id":          (0x00, 2, "le16"),
+    "version_flags":      (0x02, 1, "byte"),
+    "sweep_hi":           (0x04, 1, "byte"),
+    "sweep_lo":           (0x05, 1, "byte"),
+    "date":               (0x07, 3, "date"),      # [day, month, year-2000]
+    "time":               (0x0A, 2, "time"),      # [hours, minutes]
+    "defect_flag":        (0x0C, 1, "flag"),      # 0=no defect
+    "block_addr":         (0x10, 2, "le16"),
+    "passport_primary":   (0x11, 11, "lut"),      # LUT decode, 11 bytes
+    "passport_secondary": (0x21, 7, "lut"),       # LUT decode, 7 bytes
+    "thickness_mm":       (0x35, 2, "le16"),
+    "velocity_mps":       (0x37, 2, "le16"),
+    "amplitude_dB":       (0x38, 2, "le16"),
+    "depth_mm":           (0x39, 2, "le16"),      # conditional (TypeVar-dependent)
+    "delay_us":           (0x3A, 2, "le16"),
+    "probe_angle":        (0x3B, 2, "le16"),      # default; +0x3E for TV 680-683
+    "gate_position":      (0x3C, 2, "le16"),
+    "echo_count":         (0x3E, 2, "le16"),
+    "passport_extra":     (0x41, 7, "lut"),       # only TypeVar 680-683
+    "zone_width":         (0x45, 2, "le16"),
+    "total_length":       (0x5E, 2, "le16"),
+}
+
+
+def decode_peleng_body_field(body: bytes, field_name: str) -> object:
+    """Decode a single field from a Peleng packet body.
+
+    Args:
+        body: Raw packet body bytes (after 16-byte header)
+        field_name: Key from PELENG_BODY_FIELDS
+    Returns:
+        Decoded value (int, str, datetime.date, datetime.time, or None)
+    """
+    info = PELENG_BODY_FIELDS.get(field_name)
+    if info is None:
+        return None
+    offset, size, ftype = info
+    if offset + size > len(body):
+        return None
+
+    chunk = body[offset:offset + size]
+
+    if ftype == "le16":
+        return struct.unpack_from('<H', chunk)[0]
+    elif ftype == "lut":
+        return decode_passport_peleng(chunk)
+    elif ftype == "date":
+        day, month, year_offset = chunk[0], chunk[1], chunk[2]
+        year = 2000 + year_offset
+        try:
+            return _dt.date(year, month, day)
+        except ValueError:
+            return _dt.date(2000, 1, 1)
+    elif ftype == "time":
+        hours, minutes = chunk[0], chunk[1]
+        if 0 <= hours < 24 and 0 <= minutes < 60:
+            return _dt.time(hours, minutes)
+        return _dt.time(0, 0)
+    elif ftype in ("byte", "flag"):
+        return chunk[0]
+    return chunk
+
+
+def decode_peleng_body(body: bytes, category: int = 0) -> dict[str, object]:
+    """Decode all applicable fields from a Peleng packet body.
+
+    Args:
+        body: Raw packet body (after skipping 16-byte protocol header)
+        category: TLV category (1=A-scan, 4-6=Generic, 10-19=B-scan, 20-29=ShortProt)
+    Returns:
+        Dict of field_name → decoded_value
+    """
+    result: dict[str, object] = {}
+    # Always-present fields
+    for name in ("device_id", "date", "time", "block_addr", "passport_primary"):
+        val = decode_peleng_body_field(body, name)
+        if val is not None:
+            result[name] = val
+
+    # Category-specific fields
+    if category in (1,):  # Settings / A-scan (case 5/2)
+        for name in ("passport_secondary", "amplitude_dB", "delay_us",
+                     "gate_position", "zone_width", "defect_flag"):
+            val = decode_peleng_body_field(body, name)
+            if val is not None:
+                result[name] = val
+
+    elif category in (4, 5, 6):  # Generic
+        for name in ("thickness_mm", "velocity_mps", "depth_mm",
+                     "probe_angle", "total_length", "defect_flag"):
+            val = decode_peleng_body_field(body, name)
+            if val is not None:
+                result[name] = val
+
+    elif 10 <= category <= 19:  # B-scan / Results
+        for name in ("passport_secondary", "defect_flag", "amplitude_dB",
+                     "depth_mm", "gate_position"):
+            val = decode_peleng_body_field(body, name)
+            if val is not None:
+                result[name] = val
+
+    elif 20 <= category <= 29:  # ShortProt
+        for name in ("passport_secondary", "thickness_mm", "velocity_mps",
+                     "echo_count", "probe_angle"):
+            val = decode_peleng_body_field(body, name)
+            if val is not None:
+                result[name] = val
+
+    return result
+
+
+# =============================================================================
 # 1B. ПОЛНЫЙ СЛОВАРЬ TYPEVAR (реверс zapis2.exe + 102_203dll.dll + дамп .dal)
 # =============================================================================
 # TypeVar — это «типовой вариант» детали, под который прибор настраивает
