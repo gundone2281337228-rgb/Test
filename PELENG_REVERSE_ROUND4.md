@@ -2565,3 +2565,235 @@ def save_screen_as_png(data: bytes, filename: str, width_bytes: int = 30):
 | 176 | Последний байт [84] = контрольная сумма (различна для каждой записи) | 🔒 Железобетонно |
 
 ---
+
+
+
+## 65. Реверс C-кода транспортного уровня (PelengPC_ver1_2_PSEUDOCODE.c)
+
+**Источник:** Ручная декомпиляция PelengPC.exe v1.2 (Borland C++Builder 5, objdump)
+
+---
+
+### 65.1 Структура TCOMPort (0x4239C8)
+
+```c
+typedef struct {
+    HANDLE  hFile;      // +0x00: дескриптор (INVALID_HANDLE_VALUE = закрыт)
+    char*   portName;   // +0x04: AnsiString "\\.\COMn"
+    BYTE    baudIndex;  // +0x08: индекс (0-14), default=6
+    DWORD   baudRate;   // +0x0C: скорость, default=9600
+    BYTE    dataBits;   // +0x10: 3 (ByteSize = dataBits+5 = 8)
+    BYTE    stopBits;   // +0x11: 0 (ONESTOPBIT)
+    BYTE    parity;     // +0x12: 0 (NOPARITY) ← default в EXE!
+    BYTE    isOpen;     // +0x13: флаг
+    DWORD   timeout;    // +0x14: 1000 мс default
+} TCOMPort;
+// Глобальный экземпляр: @ 0x53E948
+```
+
+### 65.2 Карта функций транспортного уровня (11 + 4)
+
+| # | RVA | Сигнатура | Назначение |
+|---|-----|-----------|-----------|
+| 1 | 0x4239C8 | `TCOMPort_Create(self)` | Init: 9600/8N1/1000ms |
+| 2 | 0x423B4C | `TCOMPort_SetBaudRate(self, rate)` | 15 скоростей (110..256000) |
+| 3 | 0x423CC4 | `TCOMPort_SetDataBits(self, val)` | dataBits field |
+| 4 | 0x423CE0 | `TCOMPort_SetStopBits(self, val)` | stopBits field |
+| 5 | 0x423CFC | `TCOMPort_SetParity(self, val)` | parity field (0/1/2) |
+| 6 | 0x423D18 | `TCOMPort_Open(self)` | CreateFileA + COMMTIMEOUTS + Sleep(100) |
+| 7 | 0x423E28 | `TCOMPort_Close(self)` | CloseHandle |
+| 8 | 0x423E58 | `TCOMPort_WriteBytes(self, buf, size)` | Запись с deadline-reset |
+| 9 | 0x423F0C | `TCOMPort_WriteByte(self, pByte)` | Запись 1 байта |
+| 10 | 0x423F40 | `TCOMPort_BytesAvail(self)` | ClearCommError → cbInQue |
+| 11 | 0x423F64 | `TCOMPort_ReadBytes(self, buf, max)` | Чтение с idle-timeout |
+| 12 | 0x423A56 | `TCOMPort_Delay(self, ms)` | Busy-wait GetTickCount |
+| 13 | 0x424020 | `TCOMPort_ApplySettings(self)` | DCB + flow=0 |
+| 14 | 0x424A50 | `Protocol_Handshake(port, hdrBuf)` | 0x55 → до 512KB |
+| 15 | 0x424BB0 | `Protocol_FlashDump(port, op, buf, sz)` | 0x9A → expectedSize |
+| 16 | 0x424CC0 | `Protocol_BlockRequest(port, addr, buf, sz)` | 0x42+addr → expectedSize |
+
+### 65.3 TCOMPort_Open — точная последовательность
+
+```c
+// 1. CreateFileA("\\\\.\\COMn", GENERIC_READ|WRITE, 0, NULL, OPEN_EXISTING, 0, NULL)
+// 2. GetCommTimeouts → модификация:
+COMMTIMEOUTS to = {
+    .ReadIntervalTimeout        = 1,   // макс. 1мс тишины между байтами
+    .ReadTotalTimeoutMultiplier = 0,
+    .ReadTotalTimeoutConstant   = 1,   // 1мс total (минимум для одного ReadFile)
+    .WriteTotalTimeoutMultiplier= 0,
+    .WriteTotalTimeoutConstant  = 10,  // 10мс на запись
+};
+// 3. SetCommTimeouts(hFile, &to)
+// 4. Sleep(100)  ← обязательная пауза
+```
+
+### 65.4 TCOMPort_ReadBytes — алгоритм idle-timeout
+
+```c
+DWORD deadline = GetTickCount() + self->timeout;  // начальный deadline
+
+while (remaining > 0) {
+    DWORD avail = ClearCommError() → cbInQue;
+    
+    if (avail == 0) {
+        if (GetTickCount() > deadline) break;  // HARD timeout → выход
+        continue;                               // busy-wait
+    }
+    
+    ReadFile(hFile, ptr, min(remaining, avail), &read, NULL);
+    totalRead += read;
+    remaining -= read;
+    ptr += read;
+    
+    deadline = GetTickCount() + self->timeout;  // ★ СБРОС deadline!
+}
+```
+
+**Ключевое:** deadline сбрасывается после КАЖДОГО успешного чтения. Это **idle-timeout**: пока данные идут — читаем бесконечно. Тишина > `timeout` мс → выход.
+
+### 65.5 Protocol_BlockRequest (0x424CC0) — полный поток
+
+```c
+// Параметры: port, blockAddr (WORD), outBuf, expectedSize
+// 
+// ВАЖНО: blockAddr = АДРЕС В ПАМЯТИ ПРИБОРА, НЕ размер!
+// expectedSize = определяется вызывающей функцией
+
+// TX:
+WriteByte(0x42);              // опкод
+Delay(10ms);                  // busy-wait GetTickCount
+WriteByte(blockAddr & 0xFF);  // LO byte адреса
+Delay(10ms);
+WriteByte(blockAddr >> 8);    // HI byte адреса
+Delay(10ms);
+
+// RX:
+FormProgress->expectedSize = expectedSize;
+FormProgress->ShowModal();    // блокирующий приём через ReadBytes
+result = FormProgress->receivedSize;
+
+Delay(10ms);                  // пауза после приёма
+
+if (result != expectedSize) {
+    ShowError("Ошибка приёма блока");
+    TCOMPort_Close(port);
+}
+```
+
+### 65.6 Protocol_FlashDump (0x424BB0) — формат
+
+```c
+// TX:
+WriteByte(0x9A);  // единственный байт
+
+// RX:
+FormProgress->expectedSize = expectedSize;  // 4293 или 5253
+FormProgress->ShowModal();                   // блокирующий приём
+result = FormProgress->receivedSize;
+```
+
+### 65.7 Protocol_Handshake (0x424A50) — формат
+
+```c
+// TX:
+WriteByte(0x55);
+
+// RX:
+received = ReadBytes(rxBuf, 0x80010);  // до 512 KB!
+if (received < 17) → ошибка;
+
+// Parse:
+memcpy(headerBuf, rxBuf, 16);          // 16-byte header
+numElements = (received - 16) / 2 - 1; // каталог LE16[]
+```
+
+### 65.8 TCOMPort_ApplySettings (0x424020) — DCB
+
+```c
+dcb.BaudRate = self->baudRate;      // из поля объекта
+dcb.ByteSize = self->dataBits + 5;  // 3+5=8
+dcb.StopBits = self->stopBits;      // 0=ONESTOPBIT
+dcb.Parity   = self->parity;        // из поля (0=NONE по умолчанию)
+
+// ВСЕ flow control биты ПРИНУДИТЕЛЬНО = 0:
+dcb.fOutxCtsFlow    = 0;
+dcb.fOutxDsrFlow    = 0;
+dcb.fDtrControl     = 0;
+dcb.fDsrSensitivity = 0;
+dcb.fTXContinueOnXoff = 0;
+dcb.fOutX           = 0;
+dcb.fInX            = 0;
+dcb.fRtsControl     = 0;
+```
+
+### 65.9 Baud Rate таблица (0x423B4C)
+
+| Index | Rate | Index | Rate |
+|-------|------|-------|------|
+| 0 | 110 | 8 | 19200 |
+| 1 | 300 | 9 | 38400 |
+| 2 | 600 | 10 | 56000 |
+| 3 | 1200 | 11 | 57600 |
+| 4 | 2400 | 12 | 115200 |
+| 5 | 4800 | 13 | 128000 |
+| 6 | **9600** (default) | 14 | 256000 |
+| 7 | 14400 | | |
+
+### 65.10 Адресация блоков
+
+```c
+// 0x41C7C0: IsSweepAddress
+BOOL IsSweepAddress(addr) { return (addr > 9999 && addr < 30000); }
+
+// 0x41C7F0: GetBaseAddr  
+int GetBaseAddr(addr)  { return (addr / 100) * 100; }
+
+// 0x41C810: GetSubBlock
+int GetSubBlock(addr)  { return (addr % 10000) / 100; }
+
+// 0x41C838: GetIndex
+int GetIndex(addr)     { return addr % 100; }
+```
+
+### 65.11 DLL экспорты (dbdll.dll / 102_203dll.dll)
+
+```c
+// Глобальные указатели:
+// 0x5BE994 = pfn_Form_View    → _Form_View(void*, BYTE*, ULONG)
+// 0x5BE998 = pfn_SortBufData  → _SortBufData(BYTE* raw, UINT* pSize) → int*
+// 0x5BE99C = pfn_FreeBuffer   → _FreeBuffer(int allocatedPtr)
+```
+
+### 65.12 Глобальные переменные (из C-кода)
+
+| Адрес | Тип | Назначение |
+|-------|-----|-----------|
+| 0x53AF64 | FormMain* | Главная форма |
+| 0x53AF68 | FormProgress* | Форма прогресса (приём данных) |
+| 0x53AF6C | FormNastr* | Форма настроек |
+| 0x53AF74 | FormReadData* | Форма чтения данных |
+| 0x53AF8C | FormScreen* | Форма B-scan/экрана |
+| 0x53E948 | TCOMPort | Глобальный COM-порт |
+
+---
+
+## 66. Сводка находок из реверса C-кода (177-189)
+
+| # | Находка | Статус |
+|---|---------|--------|
+| 177 | TCOMPort: 9 полей (hFile, portName, baudIndex, baudRate, dataBits, stopBits, parity, isOpen, timeout) | 🔒 Железобетонно |
+| 178 | Default config: 9600/8N1/timeout=1000ms, parity загружается из реестра | 🔒 Железобетонно |
+| 179 | COMMTIMEOUTS: ReadInterval=1, ReadTotal=1, WriteTotal=10 | 🔒 Железобетонно |
+| 180 | Sleep(100ms) после открытия порта — обязательно | 🔒 Железобетонно |
+| 181 | ReadBytes: idle-timeout с deadline-reset (пока данные идут — читаем) | 🔒 Железобетонно |
+| 182 | WriteBytes: аналогичный idle-timeout с deadline-reset | 🔒 Железобетонно |
+| 183 | Protocol_BlockRequest: 0x42 + addr_LO + addr_HI (АДРЕС, не размер!) | 🔒 Железобетонно |
+| 184 | Inter-byte delay = 10ms busy-wait через GetTickCount (НЕ Sleep!) | 🔒 Железобетонно |
+| 185 | Protocol_Handshake: TX 0x55 → RX до 512KB, min 17 байт валидный | 🔒 Железобетонно |
+| 186 | Protocol_FlashDump: TX 0x9A → RX expectedSize (4293 или 5253) | 🔒 Железобетонно |
+| 187 | DCB: ВСЕ flow control биты = 0 (принудительный сброс в ApplySettings) | 🔒 Железобетонно |
+| 188 | FormProgress: модальное окно для асинхронного приёма (active/expectedSize/receivedSize) | 🔒 Железобетонно |
+| 189 | Каталог из handshake: numElements = (received - 16) / 2 - 1 (LE16 array) | 🔒 Железобетонно |
+
+---
