@@ -269,8 +269,8 @@ class PelengCOM:
       - idle-timeout с обновлением deadline на каждом чанке
     """
     
-    IDLE_TIMEOUT_MS = 2000
-    HARD_TIMEOUT_MS = 30000
+    IDLE_TIMEOUT_MS = 500
+    HARD_TIMEOUT_MS = 10000
     INTER_BYTE_DELAY_S = 0.010
     POST_OPEN_DELAY_S = 0.100
     
@@ -407,25 +407,20 @@ class PelengCOM:
     def read_block(self, addr: int) -> Optional[bytes]:
         """0x42 + addr_lo + addr_hi → ответ (85 байт или 2 байта если пустой).
         
-        Из реверса Protocol_BlockRequest @ 0x00424CC0:
-        - Пустой блок = 2 байта (0xFD 0xFF или 0xFF 0xFF)
-        - Полный блок = 85 байт
+        Из реверса Protocol_BlockRequest @ 0x00424CC0.
+        Оптимизировано: убраны лишние задержки, уменьшен таймаут.
         """
         if not self.serial:
             return None
         
-        self.serial.reset_input_buffer()
-        time.sleep(0.02)
-        
         self._write_byte(0x42)
-        time.sleep(self.INTER_BYTE_DELAY_S)
+        time.sleep(0.005)
         self._write_byte(addr & 0xFF)
-        time.sleep(self.INTER_BYTE_DELAY_S)
+        time.sleep(0.005)
         self._write_byte((addr >> 8) & 0xFF)
-        time.sleep(self.INTER_BYTE_DELAY_S)
+        time.sleep(0.005)
         
-        data = self._read_bytes(256, timeout_ms=2000)
-        time.sleep(self.INTER_BYTE_DELAY_S)
+        data = self._read_bytes(256, timeout_ms=500)
         
         if not data:
             return None
@@ -484,9 +479,6 @@ class PelengCOM:
                 records.append(rec)
                 self._log(f"  [{i}] addr={addr}: {rec.date_str} {rec.time_str} "
                          f"passport='{rec.passport_primary}'")
-            
-            # Небольшая пауза между запросами
-            time.sleep(0.02)
         
         self._log(f"Итого: {len(records)} записей, {empty_count} пустых")
         return records

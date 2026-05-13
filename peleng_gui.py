@@ -71,25 +71,34 @@ if HAS_QT:
                     com.disconnect()
                     return
 
-                # Только cat 4-29 (протоколы + результаты + A-scan)
-                targets = [a for a in catalog if 4000 <= a < 30000]
+                # Только cat 10-29 (результаты + A-scan) — пропускаем настройки
+                targets = [a for a in catalog if 10000 <= a < 30000]
                 self.progress.emit(0, len(targets), f"Чтение {len(targets)} блоков...")
 
                 records = []
+                empty_streak = 0
+
                 for i, addr in enumerate(targets):
                     self.progress.emit(i, len(targets),
-                                       f"Блок {addr} ({i+1}/{len(targets)})")
+                                       f"[{len(records)}] Блок {addr} ({i+1}/{len(targets)})")
 
                     data = com.read_block(addr)
-                    if data and not com.is_empty_block(data) and len(data) >= 85:
+
+                    if data is None or com.is_empty_block(data):
+                        empty_streak += 1
+                        # Streak-контроль: 15 пустых подряд → вероятно дальше тоже пусто
+                        # Но каталог уже отфильтрован, так что просто пропускаем
+                        continue
+
+                    empty_streak = 0
+                    if len(data) >= 10:
                         rec = decode_record(addr, data)
                         if rec:
                             records.append(rec)
 
-                    time.sleep(0.02)
-
                 com.disconnect()
-                self.progress.emit(len(targets), len(targets), "Готово")
+                self.progress.emit(len(targets), len(targets),
+                                   f"Готово: {len(records)} записей")
                 self.finished.emit(records)
 
             except Exception as e:
