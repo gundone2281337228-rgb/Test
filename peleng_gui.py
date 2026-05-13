@@ -210,16 +210,16 @@ if HAS_QT:
         def on_connect(self):
             """Подключение к COM-порту"""
             port = self.port_combo.currentText()
-            self.com = PelengCOM(port)
+            self.com = PelengCOM(port, debug=True)
             if self.com.connect():
-                data = self.com.handshake()
-                if data:
+                if self.com.test_port():
                     self.status_label.setText(
-                        f"Подключен: {port}, {len(data)} байт, "
+                        f"Подключен: {port}, payload={self.com.payload_len}, "
                         f"{'Вагонная' if self.com.is_wagon else 'Базовая'}")
                     self.btn_read.setEnabled(True)
                 else:
                     self.status_label.setText(f"Ошибка handshake на {port}")
+                    self.com.disconnect()
             else:
                 self.status_label.setText(f"Не удалось открыть {port}")
         
@@ -227,12 +227,28 @@ if HAS_QT:
             """Чтение FLASH-дампа"""
             if not self.com:
                 return
+            self.status_label.setText("Чтение FLASH...")
+            
+            # Сначала пробуем полное чтение (handshake + block)
+            data = self.com.read_all_data()
+            if data and len(data) > 16:
+                self.status_label.setText(f"Данные: {len(data)} байт")
+                # Parse TLV after 16-byte header
+                records = parse_tlv(data[16:])
+                self.load_records(records)
+                return
+            
+            # Если не получилось — пробуем Flash dump (0x9A)
             data = self.com.read_flash()
             if data:
                 self.status_label.setText(f"FLASH: {len(data)} байт")
                 # Parse TLV after 16-byte header
-                records = parse_tlv(data[16:])
-                self.load_records(records)
+                if len(data) > 16:
+                    records = parse_tlv(data[16:])
+                    self.load_records(records)
+                else:
+                    records = parse_tlv(data)
+                    self.load_records(records)
             else:
                 self.status_label.setText("Ошибка чтения FLASH")
         

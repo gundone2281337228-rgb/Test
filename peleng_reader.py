@@ -292,72 +292,390 @@ def decode_protocol(body: bytes, header: bytes = b"") -> DecodedReport:
 # ============================================================
 
 class PelengCOM:
-    """Протокол связи с дефектоскопом УД2-102 через COM-порт"""
+    """Протокол связи с дефектоскопом УД2-102 через COM-порт.
     
-    def __init__(self, port: str = "COM1", baudrate: int = 9600):
+    Реализация 1:1 по логике оригинального PelengPC.exe (0x004239C8..0x00424CC0):
+    
+    Открытие порта:
+      - CreateFileA("\\\\.\\COMn"), 8N1, no flow control
+      - SetCommTimeouts: ReadIntervalTimeout=1, ReadTotalTimeoutConstant=1,
+        WriteTotalTimeoutConstant=10
+      - Sleep(100) после открытия
+    
+    Чтение (ReadBytes @ 0x00423F64):
+      - Цикл: проверяем BytesAvail → если >0, читаем столько сколько есть
+      - Deadline = GetTickCount() + timeout (1000мс)
+      - Deadline обновляется на КАЖДОМ успешном чтении (idle-reset)
+      - Выход: набрали нужное количество ИЛИ таймаут
+    
+    Запись (WriteByte @ 0x00423F0C):
+      - Пишем ровно 1 байт за вызов (без батчинга)
+    
+    Задержка (Delay @ 0x00423A56):
+      - busy-wait через GetTickCount, 10мс между байтами команды
+    """
+    
+    # Таймаут на чтение (мс) — как в оригинале: self->timeout = 0x3E8 = 1000
+    DEFAULT_TIMEOUT_MS = 1000
+    # Таймаут idle (мс) — после последнего полученного байта.
+    # В оригинале ReadIntervalTimeout=1мс, но реально устройство шлёт пачками
+    # с паузами до 500мс между ними. Ставим 1500мс для надёжности.
+    IDLE_TIMEOUT_MS = 1500
+    # Жёсткий таймаут на всю операцию (мс) — защита от зависания
+    HARD_TIMEOUT_MS = 15000
+    # Пауза между байтами команды (мс) — из оригинала Sleep(10)
+    INTER_BYTE_DELAY_S = 0.010
+    # Пауза после открытия порта (мс) — из оригинала Sleep(100)
+    POST_OPEN_DELAY_S = 0.100
+    # Размеры Flash-дампа
+    FLASH_SIZE_WAGON = 0x1485   # 5253 байт (вагонный режим)
+    FLASH_SIZE_BASE  = 0x10C5   # 4293 байт (базовый режим)
+    
+    def __init__(self, port: str = "COM1", baudrate: int = 9600,
+                 timeout_ms: int = None, idle_ms: int = None,
+                 debug: bool = False):
         self.port = port
         self.baudrate = baudrate
+        self.timeout_ms = timeout_ms or self.DEFAULT_TIMEOUT_MS
+        self.idle_ms = idle_ms or self.IDLE_TIMEOUT_MS
         self.serial = None
         self.header = b""
         self.is_wagon = False
+        self.payload_len = 0
+        self.debug = debug
+    
+    def _log(self, msg: str):
+        """Отладочная печать"""
+        if self.debug:
+            print(f"[PelengCOM] {msg}", flush=True)
     
     def connect(self) -> bool:
-        """Открывает COM-порт и настраивает параметры"""
+        """Открывает COM-порт и настраивает параметры.
+        
+        Точная копия TCOMPort_Open @ 0x00423D18:
+        - 8 бит, 1 стоп, без чётности
+        - Все flow control ВЫКЛЮЧЕНЫ (fOutxCtsFlow=0, fRtsControl=0, fDtrControl=0...)
+        - ReadIntervalTimeout = 1 (коротенький inter-char timeout)
+        - Sleep(100) после открытия
+        """
         try:
             import serial
+            # Открываем порт с МИНИМАЛЬНЫМ таймаутом на один read-вызов
+            # (реальный таймаут управляем сами в цикле чтения)
             self.serial = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
-                bytesize=8, parity='N', stopbits=1,
-                timeout=1.0,
-                write_timeout=0.01
+                bytesize=serial.EIGHTBITS,     # dataBits=3 → 3+5=8
+                parity=serial.PARITY_NONE,      # parity=0
+                stopbits=serial.STOPBITS_ONE,   # stopBits=0 → ONESTOPBIT
+                # -- Flow Control: ВСЁ ВЫКЛЮЧЕНО (из ApplySettings @ 0x00424020) --
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
+                # -- Таймауты --
+                # pyserial timeout = как быстро один read() вернёт данные если нет байт
+                # Ставим маленький чтобы наш цикл мог быстро проверять in_waiting
+                timeout=0.05,           # 50мс — как ReadIntervalTimeout=1 + запас
+                write_timeout=1.0,      # WriteTotalTimeoutConstant=10мс в оригинале, 1с запас
             )
-            time.sleep(0.1)
+            
+            # Сбрасываем буферы (PurgeComm аналог)
+            self.serial.reset_input_buffer()
+            self.serial.reset_output_buffer()
+            
+            # Sleep(100) после открытия — из оригинала
+            time.sleep(self.POST_OPEN_DELAY_S)
+            
+            self._log(f"Подключен: {self.port} @ {self.baudrate} бод")
             return True
+            
         except Exception as e:
-            print(f"Ошибка подключения: {e}")
+            print(f"Ошибка подключения к {self.port}: {e}")
             return False
     
     def disconnect(self):
-        """Закрывает COM-порт"""
+        """Закрывает COM-порт (TCOMPort_Close @ 0x00423E28)"""
         if self.serial and self.serial.is_open:
             self.serial.close()
+            self._log("Порт закрыт")
+        self.serial = None
+    
+    def _write_byte(self, byte_val: int):
+        """Запись одного байта (TCOMPort_WriteByte @ 0x00423F0C).
+        
+        Оригинал пишет строго по 1 байту с проверкой таймаута.
+        """
+        if not self.serial or not self.serial.is_open:
+            raise IOError("Порт не открыт")
+        self.serial.write(bytes([byte_val]))
+        self.serial.flush()
+        self._log(f"TX: 0x{byte_val:02X}")
+    
+    def _read_bytes(self, max_size: int, timeout_ms: int = None) -> bytes:
+        """Чтение данных с idle-таймаутом (TCOMPort_ReadBytes @ 0x00423F64).
+        
+        Точная логика оригинала:
+        1. deadline = GetTickCount() + timeout
+        2. Цикл:
+           a. avail = BytesAvail()  [ClearCommError → cbInQue]
+           b. Если avail == 0 → проверяем deadline, если истёк — выходим
+           c. Если avail > 0 → читаем min(avail, remaining)
+           d. Обновляем deadline (!) — ключевая деталь: таймаут СБРАСЫВАЕТСЯ
+        3. Возвращаем всё что прочитали
+        
+        Это значит: таймаут — это время БЕЗДЕЙСТВИЯ (idle), а не общее время.
+        Если данные идут — ждём бесконечно (до hard_timeout).
+        """
+        if not self.serial or not self.serial.is_open:
+            return b""
+        
+        if timeout_ms is None:
+            timeout_ms = self.timeout_ms
+        
+        buf = bytearray()
+        remaining = max_size
+        
+        idle_deadline = time.monotonic() + (timeout_ms / 1000.0)
+        hard_deadline = time.monotonic() + (self.HARD_TIMEOUT_MS / 1000.0)
+        
+        while remaining > 0:
+            now = time.monotonic()
+            
+            # Hard timeout — защита от бесконечного ожидания
+            if now >= hard_deadline:
+                self._log(f"RX: HARD timeout, получено {len(buf)}/{max_size}")
+                break
+            
+            # Idle timeout — нет данных слишком долго
+            if now >= idle_deadline:
+                if len(buf) > 0:
+                    self._log(f"RX: idle timeout, получено {len(buf)}/{max_size}")
+                    break
+                # Если ещё ничего не получили — ждём до hard_deadline
+                if now >= hard_deadline:
+                    self._log(f"RX: timeout без данных")
+                    break
+                continue
+            
+            # Проверяем BytesAvail (аналог ClearCommError + cbInQue)
+            avail = self.serial.in_waiting
+            
+            if avail <= 0:
+                # Нет данных — маленькая пауза чтобы не жечь CPU
+                # (в оригинале busy-wait, но мы не варвары)
+                time.sleep(0.001)
+                continue
+            
+            # Читаем столько сколько есть, но не больше чем нужно
+            to_read = min(avail, remaining)
+            chunk = self.serial.read(to_read)
+            
+            if chunk:
+                buf.extend(chunk)
+                remaining -= len(chunk)
+                # *** КЛЮЧЕВОЙ МОМЕНТ: обновляем idle deadline ***
+                # Это то, что делает оригинал: deadline = GetTickCount() + timeout
+                idle_deadline = time.monotonic() + (self.idle_ms / 1000.0)
+                self._log(f"RX: +{len(chunk)} байт (всего {len(buf)}/{max_size})")
+        
+        return bytes(buf)
     
     def handshake(self) -> Optional[bytes]:
-        """Отправляет 0x55, принимает заголовок + данные"""
+        """Отправляет 0x55, принимает заголовок + данные.
+        
+        Точная логика Protocol_Handshake @ 0x00424A50:
+        1. WriteByte(0x55)
+        2. ReadBytes(rxBuf, 0x80010) — читает ВСЁ что прибор пришлёт
+        3. Если received < 17 — ошибка
+        4. Копируем 16-байт заголовок
+        5. Извлекаем флаги из байта 2
+        6. payload_len из байтов 6-7 (LE16)
+        
+        ВАЖНО: оригинал передаёт размер буфера 0x80010 (512K+16), но
+        реально читает столько сколько пришлёт прибор (idle timeout).
+        Прибор отвечает: 16 байт заголовок + payload данных.
+        """
         if not self.serial:
             return None
-        self.serial.write(b'\x55')
-        data = self.serial.read(0x80010)
-        if len(data) < 17:
+        
+        # Сбрасываем входной буфер перед handshake
+        self.serial.reset_input_buffer()
+        time.sleep(0.01)
+        
+        # Отправляем команду 0x55
+        self._write_byte(0x55)
+        
+        # Читаем ответ — ждём минимум 16 байт заголовка, но прибор может
+        # прислать больше (payload). Используем большой max_size и idle timeout.
+        # Оригинал ставит буфер 0x80010 но это просто "бесконечный" буфер.
+        data = self._read_bytes(0x10000, timeout_ms=self.timeout_ms)
+        
+        if len(data) < 16:
+            self._log(f"Handshake FAILED: получено {len(data)} байт (нужно >= 16)")
+            print(f"Ошибка handshake: получено {len(data)} байт, ожидалось >= 16")
             return None
+        
+        # Сохраняем заголовок
         self.header = data[:16]
-        self.is_wagon = bool(data[2] & 4)
+        
+        # Флаги из байта 2 (is_wagon = бит 2)
+        self.is_wagon = bool(data[2] & 0x04)
+        
+        # payload_len из байтов 6-7 (LE16)
+        self.payload_len = struct.unpack_from('<H', data, 6)[0]
+        
+        self._log(f"Handshake OK: {len(data)} байт, "
+                  f"wagon={self.is_wagon}, payload_len={self.payload_len}")
+        self._log(f"Header: {data[:16].hex(' ')}")
+        
         return data
     
-    def read_block(self, address: int) -> Optional[bytes]:
-        """Запрос блока по адресу (0x42 + addr_lo + addr_hi)"""
+    def read_block(self, address: int, expected_size: int = 0x10000) -> Optional[bytes]:
+        """Запрос блока по адресу (Protocol_BlockRequest @ 0x00424CC0).
+        
+        Точная логика оригинала:
+        1. WriteByte(0x42)
+        2. Delay(10мс)
+        3. WriteByte(address & 0xFF)     — младший байт адреса
+        4. Delay(10мс)
+        5. WriteByte((address >> 8) & 0xFF) — старший байт адреса
+        6. Delay(10мс)
+        7. ReadBytes(outBuf, expectedSize)
+        8. Delay(10мс) после приёма
+        
+        Args:
+            address: 16-битный адрес блока в памяти прибора
+            expected_size: ожидаемый размер ответа (байт)
+        """
         if not self.serial:
             return None
-        # Send command
-        self.serial.write(b'\x42')
-        time.sleep(0.01)
-        self.serial.write(bytes([address & 0xFF]))
-        time.sleep(0.01)
-        self.serial.write(bytes([(address >> 8) & 0xFF]))
-        time.sleep(0.01)
-        # Read response
-        data = self.serial.read(0x10000)
-        return data if len(data) > 0 else None
+        
+        # Сбрасываем входной буфер
+        self.serial.reset_input_buffer()
+        
+        # 1. Отправляем команду 0x42
+        self._write_byte(0x42)
+        time.sleep(self.INTER_BYTE_DELAY_S)
+        
+        # 2. Младший байт адреса
+        self._write_byte(address & 0xFF)
+        time.sleep(self.INTER_BYTE_DELAY_S)
+        
+        # 3. Старший байт адреса
+        self._write_byte((address >> 8) & 0xFF)
+        time.sleep(self.INTER_BYTE_DELAY_S)
+        
+        # 4. Читаем ответ
+        data = self._read_bytes(expected_size, timeout_ms=self.timeout_ms)
+        
+        # 5. Задержка после приёма (из оригинала)
+        time.sleep(self.INTER_BYTE_DELAY_S)
+        
+        if len(data) == 0:
+            self._log(f"read_block(0x{address:04X}): нет ответа")
+            return None
+        
+        self._log(f"read_block(0x{address:04X}): получено {len(data)} байт")
+        return data
     
     def read_flash(self) -> Optional[bytes]:
-        """Чтение FLASH-дампа (0x9A)"""
+        """Чтение FLASH-дампа (Protocol_FlashDump, опкод 0x9A @ 0x00424BB0).
+        
+        Точная логика оригинала:
+        1. WriteByte(0x9A)
+        2. Приём expectedSize байт через FormProgress
+           - expectedSize = 0x1485 (5253) для вагонного режима
+           - expectedSize = 0x10C5 (4293) для базового режима
+        
+        ВАЖНО: is_wagon определяется из handshake (байт 2, бит 2).
+        Нужно сначала вызвать handshake()!
+        """
         if not self.serial:
             return None
-        expected_size = 5253 if self.is_wagon else 4293
-        self.serial.write(b'\x9A')
-        data = self.serial.read(expected_size)
-        return data if len(data) >= expected_size - 5 else None
+        
+        expected_size = self.FLASH_SIZE_WAGON if self.is_wagon else self.FLASH_SIZE_BASE
+        self._log(f"read_flash: отправляем 0x9A, ожидаем {expected_size} байт "
+                  f"({'wagon' if self.is_wagon else 'base'})")
+        
+        # Сбрасываем входной буфер
+        self.serial.reset_input_buffer()
+        
+        # Отправляем команду
+        self._write_byte(0x9A)
+        
+        # Читаем ответ
+        data = self._read_bytes(expected_size, timeout_ms=self.timeout_ms)
+        
+        if len(data) < expected_size:
+            self._log(f"read_flash: НЕПОЛНЫЙ ответ {len(data)}/{expected_size}")
+            # Возвращаем что есть, если получили хотя бы заголовок
+            if len(data) >= 16:
+                print(f"ПРЕДУПРЕЖДЕНИЕ: Flash неполный ({len(data)}/{expected_size}), "
+                      f"но данные есть — возвращаем частичные")
+                return data
+            print(f"Ошибка чтения Flash: получено {len(data)}/{expected_size} байт")
+            return None
+        
+        self._log(f"read_flash: OK, {len(data)} байт")
+        return data
+    
+    def read_all_data(self) -> Optional[bytes]:
+        """Полное чтение данных из прибора (handshake + block request).
+        
+        Это комбинированная операция, аналог того что делает PelengPC
+        при нажатии "Читать данные":
+        1. Handshake (0x55) → получаем заголовок с payload_len
+        2. Block Request (0x42 + len_lo + len_hi) → получаем полный блок
+        
+        Из реверса peleng_clone: после handshake прибор знает сколько данных
+        отдать, и по команде 'B' + size_lo + size_hi отдаёт exactly столько.
+        """
+        # 1. Handshake
+        hdr_data = self.handshake()
+        if hdr_data is None:
+            return None
+        
+        if self.payload_len == 0:
+            print("Прибор вернул payload_len=0 — нет данных для чтения")
+            return hdr_data  # только заголовок
+        
+        # 2. Запрос блока данных
+        # total = заголовок (16) + payload
+        total = 16 + self.payload_len
+        self._log(f"read_all_data: запрашиваем блок, total={total}")
+        
+        block = self.read_block(address=total, expected_size=total)
+        if block is None:
+            # Попробуем альтернативу — некоторые приборы ожидают payload_len как адрес
+            self._log("Повторная попытка с payload_len как адрес...")
+            block = self.read_block(address=self.payload_len, expected_size=total)
+        
+        return block
+    
+    def test_port(self) -> bool:
+        """Быстрый тест порта — handshake без чтения данных.
+        
+        Аналог NTestPortClick в оригинале.
+        Возвращает True если прибор ответил корректным заголовком.
+        """
+        if not self.serial:
+            return False
+        
+        self.serial.reset_input_buffer()
+        self._write_byte(0x55)
+        
+        # Ждём только 16 байт заголовка
+        data = self._read_bytes(16, timeout_ms=2000)
+        
+        if len(data) >= 16:
+            self.header = data[:16]
+            self.is_wagon = bool(data[2] & 0x04)
+            self.payload_len = struct.unpack_from('<H', data, 6)[0]
+            self._log(f"test_port OK: header={data[:16].hex(' ')}")
+            return True
+        
+        self._log(f"test_port FAIL: {len(data)} байт")
+        return False
 
 
 # ============================================================
@@ -496,8 +814,9 @@ def demo_decode_xml():
 
 
 if __name__ == "__main__":
-    print("PelengPC Reader v1.0")
+    print("PelengPC Reader v2.0")
     print("Сбор данных с дефектоскопа УД2-102")
+    print("(Реверс-инженерия PelengPC.exe → Python)")
     print()
     
     if len(sys.argv) > 1 and sys.argv[1] == "--demo-xml":
@@ -516,8 +835,68 @@ if __name__ == "__main__":
         
         report = decode_protocol(bytes(sample_body))
         print_report(report)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--port":
+        # Подключение к реальному прибору
+        port_name = sys.argv[2] if len(sys.argv) > 2 else "COM3"
+        baud = int(sys.argv[3]) if len(sys.argv) > 3 else 9600
+        
+        print(f"Подключение к {port_name} @ {baud} бод...")
+        print(f"(Используйте --debug для подробного лога)")
+        debug = "--debug" in sys.argv
+        
+        com = PelengCOM(port_name, baudrate=baud, debug=debug)
+        if not com.connect():
+            print("ОШИБКА: не удалось открыть порт")
+            sys.exit(1)
+        
+        print("Порт открыт. Тестируем подключение (handshake 0x55)...")
+        if com.test_port():
+            print(f"✓ Прибор ответил!")
+            print(f"  Header:      {com.header.hex(' ')}")
+            print(f"  Payload len: {com.payload_len}")
+            print(f"  Режим:       {'Вагонный' if com.is_wagon else 'Базовый'}")
+            print()
+            
+            # Пробуем прочитать данные
+            print("Читаем данные (read_all_data)...")
+            data = com.read_all_data()
+            if data and len(data) > 16:
+                print(f"✓ Получено {len(data)} байт")
+                records = parse_tlv(data[16:])
+                print(f"  Найдено TLV-записей: {len(records)}")
+                for i, rec in enumerate(records[:10]):
+                    print(f"  [{i}] tag={rec.tag}, size={rec.size}, "
+                          f"cat={rec.category_name}")
+                if len(records) > 10:
+                    print(f"  ... и ещё {len(records) - 10} записей")
+            else:
+                print("Нет данных через read_all_data, пробуем Flash (0x9A)...")
+                flash_data = com.read_flash()
+                if flash_data:
+                    print(f"✓ Flash: {len(flash_data)} байт")
+                    if len(flash_data) > 16:
+                        records = parse_tlv(flash_data[16:])
+                        print(f"  Найдено TLV-записей: {len(records)}")
+                else:
+                    print("✗ Flash тоже не удалось прочитать")
+        else:
+            print("✗ Прибор не ответил на handshake")
+            print("  Проверьте:")
+            print("  1. Кабель подключён?")
+            print("  2. Прибор включён?")
+            print("  3. Правильный COM-порт?")
+            print("  4. Скорость (попробуйте 19200, 9600, 4800)")
+        
+        com.disconnect()
     else:
         print("Использование:")
+        print("  python peleng_reader.py --port COM3 [baud] [--debug]")
+        print("                                     Подключение к прибору")
         print("  python peleng_reader.py --demo-xml     Дешифровка XML протокола")
         print("  python peleng_reader.py --demo-decode  Демо декодирования пакета")
-        print("  python peleng_reader.py --port COM3    Подключение к прибору")
+        print()
+        print("Примеры:")
+        print("  python peleng_reader.py --port COM3")
+        print("  python peleng_reader.py --port COM3 19200")
+        print("  python peleng_reader.py --port COM3 9600 --debug")
+        print("  python peleng_reader.py --port /dev/ttyUSB0 19200 --debug")
