@@ -188,25 +188,41 @@ class DecodedReport:
 # ============================================================
 
 def parse_tlv(data: bytes) -> List[TLVRecord]:
-    """Парсит TLV-поток (после 16-byte header)"""
+    """Парсит TLV-поток (после 16-byte header).
+    
+    Формат записи (из реверса 102_203dll.dll @ _SortBufData):
+      [0..1] = tag (LE16) — адрес/идентификатор записи
+      [2..3] = total_length (LE16) — ПОЛНЫЙ размер записи (включая эти 4 байта!)
+      [4..total_length-1] = body (тело записи)
+    
+    Следующая запись начинается по смещению pos + total_length.
+    Между записями может быть padding из 0xFF.
+    """
     records = []
     pos = 0
     while pos + 4 <= len(data):
         tag = struct.unpack_from('<H', data, pos)[0]
         if tag == 0xFFFF:
-            break
-        length = struct.unpack_from('<H', data, pos + 2)[0]
-        if length == 0 or pos + 4 + length > len(data):
+            # Пропускаем padding
+            while pos < len(data) and data[pos] == 0xFF:
+                pos += 1
+            continue
+        total_length = struct.unpack_from('<H', data, pos + 2)[0]
+        # total_length включает 4 байта заголовка (tag + length)
+        # Минимальный размер = 4 (пустое тело), проверяем границы
+        if total_length < 4 or pos + total_length > len(data):
+            # Невалидная запись — пропускаем байт и пробуем дальше
             pos += 1
             continue
-        body = data[pos + 4:pos + 4 + length]
+        body = data[pos + 4:pos + total_length]
+        body_size = total_length - 4
         category = tag // 1000
         records.append(TLVRecord(
-            tag=tag, offset=pos, size=length,
+            tag=tag, offset=pos, size=body_size,
             body=body, category=category
         ))
-        pos += 4 + length
-        # Skip padding 0xFF
+        pos += total_length
+        # Skip padding 0xFF между записями
         while pos < len(data) and data[pos] == 0xFF:
             pos += 1
     return records
