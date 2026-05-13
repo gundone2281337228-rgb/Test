@@ -227,30 +227,39 @@ if HAS_QT:
             """Чтение FLASH-дампа"""
             if not self.com:
                 return
-            self.status_label.setText("Чтение FLASH...")
+            self.status_label.setText("Чтение данных...")
             
-            # Сначала пробуем полное чтение (handshake + block)
+            # Сначала пробуем полное чтение (handshake → данные уже в ответе)
             data = self.com.read_all_data()
             if data and len(data) > 16:
-                self.status_label.setText(f"Данные: {len(data)} байт")
+                self.status_label.setText(f"Данные: {len(data)} байт (из handshake)")
                 # Parse TLV after 16-byte header
                 records = parse_tlv(data[16:])
-                self.load_records(records)
-                return
+                if records:
+                    self.load_records(records)
+                    return
+                # Если TLV не нашли — попробуем парсить с начала (без header skip)
+                records = parse_tlv(data)
+                if records:
+                    self.load_records(records)
+                    return
             
             # Если не получилось — пробуем Flash dump (0x9A)
+            self.status_label.setText("Чтение Flash (0x9A)...")
             data = self.com.read_flash()
             if data:
                 self.status_label.setText(f"FLASH: {len(data)} байт")
                 # Parse TLV after 16-byte header
                 if len(data) > 16:
                     records = parse_tlv(data[16:])
+                    if not records:
+                        records = parse_tlv(data)
                     self.load_records(records)
                 else:
                     records = parse_tlv(data)
                     self.load_records(records)
             else:
-                self.status_label.setText("Ошибка чтения FLASH")
+                self.status_label.setText("Ошибка чтения данных")
         
         def on_demo(self):
             """Загрузка демо-данных (создаёт тестовые записи)"""

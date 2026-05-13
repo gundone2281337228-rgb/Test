@@ -319,10 +319,14 @@ class PelengCOM:
     DEFAULT_TIMEOUT_MS = 1000
     # Таймаут idle (мс) — после последнего полученного байта.
     # В оригинале ReadIntervalTimeout=1мс, но реально устройство шлёт пачками
-    # с паузами до 500мс между ними. Ставим 1500мс для надёжности.
-    IDLE_TIMEOUT_MS = 1500
+    # с паузами до 500мс между ними. Ставим 2000мс для надёжности.
+    IDLE_TIMEOUT_MS = 2000
+    # Idle таймаут для Flash-операций (мс) — Flash шлёт по 32 байта с
+    # межпакетными паузами, при переходе между секторами пауза может быть >1.5с.
+    # Из лога: 4006/4293 обрыв = прибор делал паузу на boundary сектора.
+    FLASH_IDLE_TIMEOUT_MS = 5000
     # Жёсткий таймаут на всю операцию (мс) — защита от зависания
-    HARD_TIMEOUT_MS = 15000
+    HARD_TIMEOUT_MS = 30000
     # Пауза между байтами команды (мс) — из оригинала Sleep(10)
     INTER_BYTE_DELAY_S = 0.010
     # Пауза после открытия порта (мс) — из оригинала Sleep(100)
@@ -587,8 +591,11 @@ class PelengCOM:
            - expectedSize = 0x1485 (5253) для вагонного режима
            - expectedSize = 0x10C5 (4293) для базового режима
         
-        ВАЖНО: is_wagon определяется из handshake (байт 2, бит 2).
-        Нужно сначала вызвать handshake()!
+        ВАЖНО: 
+        - is_wagon определяется из handshake (байт 2, бит 2).
+          Нужно сначала вызвать handshake()!
+        - Flash шлёт данные по 32 байта с паузами. При переходе между
+          секторами пауза может быть >1.5с! Используем FLASH_IDLE_TIMEOUT_MS.
         """
         if not self.serial:
             return None
@@ -603,8 +610,14 @@ class PelengCOM:
         # Отправляем команду
         self._write_byte(0x9A)
         
-        # Читаем ответ
-        data = self._read_bytes(expected_size, timeout_ms=self.timeout_ms)
+        # Читаем ответ с УВЕЛИЧЕННЫМ idle timeout для Flash
+        # (Flash шлёт по 32 байта, при sector boundary пауза может быть >1.5с)
+        saved_idle = self.idle_ms
+        self.idle_ms = self.FLASH_IDLE_TIMEOUT_MS
+        try:
+            data = self._read_bytes(expected_size, timeout_ms=self.timeout_ms)
+        finally:
+            self.idle_ms = saved_idle
         
         if len(data) < expected_size:
             self._log(f"read_flash: НЕПОЛНЫЙ ответ {len(data)}/{expected_size}")
@@ -620,37 +633,54 @@ class PelengCOM:
         return data
     
     def read_all_data(self) -> Optional[bytes]:
-        """Полное чтение данных из прибора (handshake + block request).
+        """Полное чтение данных из прибора (handshake → данные).
         
-        Это комбинированная операция, аналог того что делает PelengPC
-        при нажатии "Читать данные":
-        1. Handshake (0x55) → получаем заголовок с payload_len
-        2. Block Request (0x42 + len_lo + len_hi) → получаем полный блок
+        ВАЖНО (из реального теста): прибор УД2-102 отдаёт ВСЕ данные
+        прямо в ответе на handshake (0x55)! Не нужен отдельный block request.
         
-        Из реверса peleng_clone: после handshake прибор знает сколько данных
-        отдать, и по команде 'B' + size_lo + size_hi отдаёт exactly столько.
+        Из лога:
+          - Handshake вернул 599 байт = 16 header + 583 payload
+          - payload_len в заголовке = 519 (но фактически payload = 583)
+          
+        Алгоритм:
+        1. Отправляем 0x55
+        2. Читаем ВСЁ что прибор пришлёт (с idle timeout)
+        3. Первые 16 байт = заголовок, остальное = TLV данные
+        4. Если данных в handshake недостаточно (payload_len > полученного) —
+           пробуем дочитать block request
         """
-        # 1. Handshake
+        # 1. Handshake — читаем ВСЁ
         hdr_data = self.handshake()
         if hdr_data is None:
             return None
         
+        # Данные уже получены в handshake!
+        actual_payload = len(hdr_data) - 16
+        self._log(f"read_all_data: handshake вернул {len(hdr_data)} байт "
+                  f"(header=16 + payload={actual_payload}), "
+                  f"заявленный payload_len={self.payload_len}")
+        
+        if actual_payload > 0:
+            # Данные уже есть — используем их напрямую
+            self._log(f"read_all_data: данные получены из handshake ({actual_payload} байт payload)")
+            return hdr_data
+        
+        # Если handshake вернул только заголовок — пробуем block request
         if self.payload_len == 0:
             print("Прибор вернул payload_len=0 — нет данных для чтения")
-            return hdr_data  # только заголовок
+            return hdr_data
         
-        # 2. Запрос блока данных
-        # total = заголовок (16) + payload
+        # Запрос блока — передаём payload_len как размер (peleng_clone стиль)
         total = 16 + self.payload_len
-        self._log(f"read_all_data: запрашиваем блок, total={total}")
-        
+        self._log(f"read_all_data: handshake без payload, запрашиваем блок ({total} байт)")
         block = self.read_block(address=total, expected_size=total)
-        if block is None:
-            # Попробуем альтернативу — некоторые приборы ожидают payload_len как адрес
-            self._log("Повторная попытка с payload_len как адрес...")
-            block = self.read_block(address=self.payload_len, expected_size=total)
         
-        return block
+        if block and len(block) > 16:
+            return block
+        
+        # Если не сработало — возвращаем то что есть из handshake
+        self._log("read_all_data: block request не дал данных, возвращаем handshake")
+        return hdr_data
     
     def test_port(self) -> bool:
         """Быстрый тест порта — handshake без чтения данных.
@@ -857,26 +887,43 @@ if __name__ == "__main__":
             print(f"  Режим:       {'Вагонный' if com.is_wagon else 'Базовый'}")
             print()
             
-            # Пробуем прочитать данные
-            print("Читаем данные (read_all_data)...")
+            # Читаем данные — handshake уже содержит payload!
+            print("Читаем данные (read_all_data = handshake с полным приёмом)...")
             data = com.read_all_data()
             if data and len(data) > 16:
-                print(f"✓ Получено {len(data)} байт")
+                actual_payload = len(data) - 16
+                print(f"✓ Получено {len(data)} байт (header=16 + payload={actual_payload})")
                 records = parse_tlv(data[16:])
+                if not records:
+                    # Попробуем без пропуска заголовка
+                    records = parse_tlv(data)
                 print(f"  Найдено TLV-записей: {len(records)}")
                 for i, rec in enumerate(records[:10]):
                     print(f"  [{i}] tag={rec.tag}, size={rec.size}, "
                           f"cat={rec.category_name}")
                 if len(records) > 10:
                     print(f"  ... и ещё {len(records) - 10} записей")
+                
+                if not records:
+                    print()
+                    print("  TLV-записи не найдены. Hex-дамп первых 64 байт payload:")
+                    payload = data[16:80]
+                    for i in range(0, len(payload), 16):
+                        hex_str = ' '.join(f'{b:02x}' for b in payload[i:i+16])
+                        print(f"    {i:04x}: {hex_str}")
             else:
-                print("Нет данных через read_all_data, пробуем Flash (0x9A)...")
+                print(f"  Handshake вернул только заголовок ({len(data) if data else 0} байт)")
+                print()
+                print("Пробуем Flash dump (0x9A)...")
                 flash_data = com.read_flash()
                 if flash_data:
                     print(f"✓ Flash: {len(flash_data)} байт")
                     if len(flash_data) > 16:
                         records = parse_tlv(flash_data[16:])
                         print(f"  Найдено TLV-записей: {len(records)}")
+                        for i, rec in enumerate(records[:10]):
+                            print(f"  [{i}] tag={rec.tag}, size={rec.size}, "
+                                  f"cat={rec.category_name}")
                 else:
                     print("✗ Flash тоже не удалось прочитать")
         else:
