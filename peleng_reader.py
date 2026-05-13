@@ -171,8 +171,8 @@ class MeasurementRecord:
     def date_str(self) -> str:
         """Форматированная дата."""
         if 1 <= self.month <= 12 and 1 <= self.day <= 31:
-            return f"{self.day:02d}.{self.month:02d}"
-        return "??.??"
+            return f"{self.day:02d}.{self.month:02d}.{self.year_field}"
+        return "??.??.????"
     
     @property
     def time_str(self) -> str:
@@ -226,17 +226,15 @@ def decode_record(addr: int, raw: bytes) -> Optional[MeasurementRecord]:
     rec.device_id = struct.unpack_from('<H', raw, 0x02)[0]
     rec.typevar = struct.unpack_from('<H', raw, 0x04)[0]
     
-    # Дата/время
+    # Дата/время (подтверждено: day=0x06, month=0x07, year=0x08, hour=0x09, min=0x0A)
+    rec.day = raw[0x06]
     rec.month = raw[0x07]
-    rec.day = raw[0x08]
+    rec.year_field = raw[0x08] + 2000  # year - 2000
     rec.hour = raw[0x09]
     rec.minute = raw[0x0A]
     
     # Defect flags
     rec.defect_flags = struct.unpack_from('<H', raw, 0x0C)[0]
-    
-    # Year field
-    rec.year_field = struct.unpack_from('<H', raw, 0x0E)[0]
     
     # Сторона
     rec.side = raw[0x10]
@@ -413,6 +411,7 @@ class PelengCOM:
         if not self.serial:
             return None
         
+        self.serial.reset_input_buffer()
         self._write_byte(0x42)
         time.sleep(0.005)
         self._write_byte(addr & 0xFF)
