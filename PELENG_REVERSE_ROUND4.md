@@ -1465,3 +1465,180 @@ for (idx = 0; idx < field_count; idx++) {
 | 118 | Hidden field marker: type_code set to 0xFF | 🔒 |
 
 ---
+
+
+## 30. FUN_004058df — Focusing Correction (ближняя зона, ПОЛНЫЕ коэффициенты)
+
+```c
+float FocusingCorrection(int channel, float distance, float near_field_mm) {
+    float ratio = (distance + near_field_mm) / DAT_0051c684;
+    float diameter_factor = 2*sqrt(Real48[DGS+0x34]) / DAT_0051c680;
+    
+    if (distance > DAT_0051c66c || (distance == DAT_0051c66c && channel != 0)) {
+        // Переходная зона (1.5N < x < 3N):
+        float base = log10(exp) * 20.0;  // дБ
+        if (distance < DAT_0051c670) {
+            // Полиномиальная коррекция:
+            base = base - (ratio * -10.04 + 29.83) * diameter_factor;
+            base = ratio * -1.43 + 3.86 + base;
+        }
+        return base;
+    } else {
+        // Ближняя зона (x < 1.5N):
+        if (distance < DAT_0051c674 || (distance == DAT_0051c674 && channel == 0)) {
+            // Глубокая ближняя зона (< 0.7N):
+            return diameter_factor * 159.0 
+                   + (ratio*ratio * 19.1 - ratio * 7.2) 
+                   - diameter_factor*diameter_factor * 176.0 
+                   - 49.4;
+        } else {
+            // Промежуточная зона (0.7N..1.5N):
+            return diameter_factor * 180.0 
+                   + (ratio * 35.8 - ratio*ratio * 17.1) 
+                   - diameter_factor*diameter_factor * 214.0 
+                   - 63.5;
+        }
+    }
+}
+```
+
+### Ключевые константы DGS-формулы:
+
+| Зона | Коэффициенты | Описание |
+|---|---|---|
+| Переходная (1.5N-3N) | -10.04, 29.83, -1.43, 3.86 | Логарифм + линейная коррекция |
+| Промежуточная (0.7N-1.5N) | 180.0, 35.8, -17.1, -214.0, -63.5 | Полином 2-го порядка |
+| Глубокая (< 0.7N) | 159.0, 19.1, -7.2, -176.0, -49.4 | Полином 2-го порядка |
+
+---
+
+## 31. Базовые GDI-обёртки
+
+| Функция | Реальное действие | Параметры |
+|---|---|---|
+| FUN_00406870 | CDC::MoveTo(dc, x, y) | this=dc, param2=x, param3=y |
+| FUN_004068b0 | DeleteObject(pen) | Удаляет перо (CPen destructor) |
+| FUN_004068d0 | CDC::LineTo(dc, x, y) | this=dc, param1=x, param2=y |
+| FUN_004068f0 | SetPixel(dc, x, y, color) | Одна точка |
+| FUN_00406920 | float-to-int (rounded) | Банковское округление (>0.5) |
+| FUN_00406980 | strcmp(str1, str2) != 0 | Сравнение строк |
+| FUN_004069c0 | CPoint(x, y) | Создание точки |
+| FUN_00406a30 | CreatePen(style, width, color) | Создание пера для рисования |
+| FUN_0047c281 | CDC::MoveTo(dc, x, y) -> old_point | MoveTo с возвратом прежней позиции |
+
+---
+
+## 32. FUN_00406920 — Float-to-Int с округлением
+
+```c
+int FloatToIntRounded(float value) {
+    int truncated = (int)value;
+    float frac = fabs(value - (float)truncated);
+    if (frac > 0.5) {
+        if (truncated < 1) truncated--;  // для отрицательных
+        else truncated++;                 // для положительных
+    }
+    return truncated;
+}
+```
+
+---
+
+## 33. FUN_004157b2 — Инициализация главной формы (OnInitialUpdate)
+
+Полная цепочка:
+```
+1. FUN_0040da36(param_1[0x18])     -> инит DGS/scale/callbacks
+2. Копирование B-scan scale fn -> widget (+0x165C -> +0x40 = scaleFn)
+3. Создание CEdit "numZap" (5 символов шириной) -> SetAt("numZap", edit)
+4. Измерение текстовых размеров -> DAT_0051cb48, DAT_0051cb2c
+5. Цикл по param_1[0x26]+0x48 полям (stride 0x1C):
+   - Проверка visibility callback (+0x64 в stride)
+   - Создание CEdit для типов 0x24, 0x25, 0x26, 0x2C, 0x36, 0x4D
+   - SetAt(field_name, edit_control)
+6. Цикл по param_1[0x26]+0xB3C B-scan полям (тот же stride 0x1C):
+   - Проверка visibility (+0xB58 в stride)
+   - Создание CEdit для типов 0x25, 0x32
+```
+
+### Ключевые offsets в main form structure:
+
+| Offset | Описание |
+|---|---|
+| param_1[0x06] | Field counter (auto-increment) |
+| param_1[0x0B] | CMapStringToPtr (name->control) |
+| param_1[0x18] | Raw data pointer |
+| param_1[0x26] | Template pointer (= this+0x98 эквивалент) |
+| param_1[0x26]+0x48 | Standard field count |
+| param_1[0x26]+0x50 | Standard field[i].size_packed |
+| param_1[0x26]+0x54 | Standard field[i].type_code |
+| param_1[0x26]+0x64 | Standard field[i].visibility_callback |
+| param_1[0x26]+0xB3C | B-scan field count |
+| param_1[0x26]+0xB44 | B-scan field[i].size_packed |
+| param_1[0x26]+0xB48 | B-scan field[i].type_code |
+| param_1[0x26]+0xB4C | B-scan field[i].name_string |
+| param_1[0x26]+0xB58 | B-scan field[i].visibility_callback |
+
+---
+
+## 34. FUN_00422629 — A-scan Bitmap Init
+
+```c
+void InitAScanBitmap(int* param_1) {
+    // Выбор DGS divider:
+    if ((DAT_0051cb30 & 8) == 0)
+        DAT_0051cb44 = 10.0f;    // 0x41200000 = 10.0
+    else
+        DAT_0051cb44 = 20.0f;    // 0x41a00000 = 20.0
+    
+    // Создание DC и bitmap:
+    CreateCompatibleDC(0);
+    CreateBitmap(local_34);
+    
+    // Чтение "Label" из реестра:
+    label = FUN_00408834("Label");  // HKLM\SOFTWARE\Altek\PelengPC\Label
+    
+    // Инициализация пиксельного массива:
+    param_1[0x13] = DAT_0051c7a4;  // width
+    param_1[0x14] = DAT_0051c7a8;  // height
+    param_1[0x12] = alloc(width * 4);  // row pointers
+    for (row = 0; row < width; row++) {
+        param_1[0x12][row] = alloc(height * 4);
+        for (col = 0; col < height; col++) {
+            param_1[0x12][row][col] = GetPixelColor(dc, row, col);
+        }
+    }
+}
+```
+
+---
+
+## 35. Математические функции (CRT library)
+
+| RVA | Имя | Формула | Использование |
+|---|---|---|---|
+| FUN_00431b40 | exp(x) | e^x | DGS exponent |
+| FUN_00431a84 | log10(x) | lg(x) | dB = 20*log10(A) |
+| FUN_004319c4 | sqrt(x) | sqrt(x) | Диаметр = 2*sqrt(Real48) |
+| FUN_0043185f | fabs(x) | abs(x) | Округление |
+| FUN_004310c0 | memcpy(dst, src, n) | copy | Везде |
+| __ftol | float->long | truncate | Координаты рисования |
+
+---
+
+## 36. Сводка (дополнение)
+
+| # | Находка | Статус |
+|---|---------|--------|
+| 119 | FUN_004058df: 3 зоны, полиномиальные коэффициенты | 🔒 Железобетонно |
+| 120 | Глубокая зона: 159.0, 19.1, -7.2, -176.0, -49.4 | 🔒 Железобетонно |
+| 121 | Промежуточная: 180.0, 35.8, -17.1, -214.0, -63.5 | 🔒 Железобетонно |
+| 122 | Переходная: -10.04, 29.83, -1.43, 3.86 | 🔒 Железобетонно |
+| 123 | FUN_00406920: float->int с банковским округлением | 🔒 Железобетонно |
+| 124 | DAT_0051cb44 = 10.0 или 20.0 (DevFlags bit3) | 🔒 Железобетонно |
+| 125 | FUN_004157b2: two field loops (+0x48 std, +0xB3C bscan) | 🔒 Железобетонно |
+| 126 | B-scan fields: +0xB44/+0xB48/+0xB4C/+0xB58 stride 0x1C | 🔒 Железобетонно |
+| 127 | 9 GDI wrappers (MoveTo, LineTo, SetPixel, CreatePen...) | 🔒 Железобетонно |
+| 128 | 6 CRT math (exp, log10, sqrt, fabs, memcpy, ftol) | 🔒 Железобетонно |
+
+---
