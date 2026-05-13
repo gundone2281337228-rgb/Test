@@ -1801,3 +1801,234 @@ FUN_00405832 → FUN_004151ea (Print/Preview entry point)
 | 136 | Full report pipeline: 8 functions in sequence | 🔒 Железобетонно |
 
 ---
+
+
+## 42. B-scan Zones (BC1, BC2, BC1+BC2)
+
+### Case 0x1D в FUN_0040b7fd — Тип B-scan (5 вариантов):
+
+| Byte value | DAT Address | Строка | Описание |
+|---|---|---|---|
+| 0 | DAT_004b26e0 | "BC1" | B-scan зона 1 (первый строб) |
+| 1 | DAT_004b26ec | "BC2" | B-scan зона 2 (второй строб) |
+| 2 | DAT_004b26f0 | (другой тип) | Специальный режим |
+| 3 | DAT_004b26f4 | **"BC1+BC2"** | Оба строба одновременно |
+| 4 | DAT_004b26fc | (пятый тип) | Расширенный |
+
+### Откуда берётся тип B-scan:
+
+```c
+byte bscan_type = ReadByte(DGS_settings + field_data_offset);
+// Хранится в DGS-поле с type_code = 0x1D
+// data_offset берётся из DGS field array: [idx*12 + 0x1C]
+```
+
+### Связь с отчётом:
+
+- **raw body offset +0x190 (400)**, bits 1-2 определяют режим BC
+- Byte @ +0x190: `& 1` = есть BC, `& 6` = тип (0/2/4/6)
+- FUN_00411799 декодирует: byte[400] & 6 → индекс BC типа
+
+---
+
+## 43. Gate/Zone Logic — Полная дешифровка (FUN_00405236)
+
+### Структура двух стробов в template:
+
+```
+Gate 1 (Строб 1 / Зона 1):
+  template[0x08] = data_offset для gate1_start (ReadLE16)
+  template[0x0C] = data_offset для gate1_end (ReadLE16)
+  template[0x10] = data_offset для gate1_level (ReadByte)
+  template[0x14] = data_offset для gate1_threshold (ReadByte)
+
+Gate 2 (Строб 2 / Зона 2):
+  template[0x18] = data_offset для gate2_start (ReadLE16)
+  template[0x1C] = data_offset для gate2_end (ReadLE16)
+  template[0x20] = data_offset для gate2_level (ReadByte)
+  template[0x24] = data_offset для gate2_threshold (ReadByte)
+
+Cursor (маркер между стробами):
+  template[0x28] = data_offset для cursor_start (ReadLE16)
+  template[0x2C] = data_offset для cursor_end (ReadLE16)
+```
+
+### Условие рисования стробов:
+
+```c
+// Gate 1:
+if (template+0x165C != 0) {                    // B-scan widget exists?
+    byte zone_type = ReadByte(*(template+0x165C));
+    if (zone_type == 3) {
+        // DGS curve: FUN_00405c4c(gate1_start, gate1_end, level, threshold, widget)
+    } else {
+        // Simple line: FUN_00416bd9(gate1_start, gate1_end, level, threshold)
+    }
+}
+
+// Gate 2: same logic with offsets +0x18..+0x24
+```
+
+### Имя зоны (lookup):
+
+```c
+// Gate 1 zone name:
+char* gate1_name = DGS_settings[0x56C + ReadByte(template[0x14]) * 4];
+// Если gate1_name != "" (DAT_004aa17c) → рисуем строб
+
+// Gate 2 zone name:
+char* gate2_name = DGS_settings[0x5BC + ReadByte(template[0x24]) * 4];
+// Если gate2_name != "" (DAT_004aa180) → рисуем строб
+```
+
+### Zone Name Tables в DGS объекте:
+
+```
+DGS+0x56C: Gate1_zone_names[N]  — массив строк (имена зон для строба 1)
+DGS+0x5BC: Gate2_zone_names[N]  — массив строк (имена зон для строба 2)
+```
+
+Индекс = ReadByte(gate_threshold_offset), т.е. значение порога одновременно
+служит индексом в таблицу имён зон!
+
+---
+
+## 44. Cursor Line (маркер дефекта)
+
+### Условие отрисовки:
+
+```c
+short cursor_start = ReadLE16(template[0x28]);
+short cursor_end = ReadLE16(template[0x2C]);
+if (cursor_start - cursor_end < -1) {
+    // Рисуем пунктирную линию:
+    CreatePen(PS_DOT=0, width=3, color=BLACK);
+    x1 = cursor_start * scaleX;
+    x2 = cursor_end * scaleX;
+    y = -(height - baseY) / 2;  // посередине A-scan
+    MoveTo(dc, x1, y);
+    LineTo(dc, x2, y);
+}
+```
+
+### Интерпретация:
+
+Cursor line = **маркер положения дефекта** на оси времени.
+Рисуется как пунктирная горизонтальная линия ПОСЕРЕДИНЕ A-scan,
+от cursor_start до cursor_end. Показывает оператору, ГДЕ именно
+на развёртке обнаружен дефект.
+
+---
+
+## 45. FUN_004164c5 — B-scan Widget Renderer
+
+### Два режима:
+
+**Режим Preview (dc == NULL):**
+```c
+this->bscan_ready = 0;
+// BitBlt из this->bitmap (GDI) на экран:
+SelectObject(this->memDC, this->bitmap);
+BitBlt(param_1_dc, x, y, width, -height, this->memDC, 0, 0, SRCCOPY);
+```
+
+**Режим Print (dc != NULL):**
+```c
+this->bscan_ready = 1;
+// Создаёт compatible DC + bitmap, рисует в него, затем BitBlt:
+CreateCompatibleDC(param_1_dc);
+CreateCompatibleBitmap(width, -height);
+// ... (this->vtable+0x20)() — вызов виртуального метода отрисовки
+BitBlt(param_1_dc, x, y, width, -height, newDC, 0, 0, SRCCOPY);
+```
+
+### Параметры BitBlt:
+- Destination: (DAT_0051cb24, DAT_0051cb28) — текущий cursor
+- Size: (this+0x90, -(this+0x8C)) — width, -height (инвертированная Y)
+- Source: (0, 0) от bitmap
+- ROP: 0xCC0020 = SRCCOPY
+
+---
+
+## 46. Полная формула пересчёта развёртки (time→distance)
+
+### Из FUN_0040b7fd case 0x12 (DISTANCE):
+
+```python
+def raw_to_distance_mm(raw_le16, mode_byte_at_0x660, dgs_divider, scale_mult):
+    """
+    raw_le16: LE16 value from body
+    mode_byte_at_0x660: byte из DGS+0x660 (режим делителя)
+    dgs_divider: DAT_0051cb44 (10.0 или 20.0)
+    scale_mult: DAT_00515ea0 (1 или 2)
+    """
+    shift = mode_byte_at_0x660 & 0x1F
+    samples = raw_le16 * (0xF0 >> shift)  # 0xF0 = 240
+    distance_mm = samples / (scale_mult * dgs_divider)
+    return distance_mm
+```
+
+### Из FUN_0040b7fd case 0x13 (TIME):
+
+```python
+def raw_to_time_us(raw_le16, dgs_divider):
+    """
+    raw_le16: LE16 value from body
+    dgs_divider: DAT_0051cb44 (10.0 или 20.0)
+    """
+    time_us = raw_le16 / dgs_divider
+    return time_us
+```
+
+### Связь time↔distance:
+
+```python
+distance_mm = time_us * speed_mm_us / 2  # /2 для прямого луча (туда-обратно)
+# speed_mm_us = Real48 из DGS+0x08
+```
+
+---
+
+## 47. Field Name Iteration — How Fields Get Into Report
+
+### Standard fields (template+0x48):
+
+```c
+for (i = 0; i < template[0x48]; i++) {
+    char* field_name = *(char**)(template + 0x58 + i * 0x1C);
+    FUN_00421fc6(this, field_name, dc);  // render field to report
+}
+```
+
+### B-scan fields (template+0xB3C):
+
+```c
+for (i = 0; i < template[0xB3C]; i++) {
+    char* field_name = *(char**)(template + 0xB4C + i * 0x1C);
+    FUN_00421fc6(this, field_name, dc);  // render field to report
+}
+```
+
+### Field name offsets in template (confirmed):
+
+| Template offset | Description |
+|---|---|
+| +0x48 | Standard field count |
+| +0x58 + i*0x1C | Standard field[i].name_ptr |
+| +0xB3C | B-scan field count |
+| +0xB4C + i*0x1C | B-scan field[i].name_ptr |
+
+---
+
+## 48. Сводка (финальная — 142 находки)
+
+| # | Находка | Статус |
+|---|---------|--------|
+| 137 | B-scan type 0x1D: 5 вариантов (BC1/BC2/BC1+BC2/...) | 🔒 Железобетонно |
+| 138 | Zone names: DGS+0x56C (gate1), DGS+0x5BC (gate2) indexed by threshold | 🔒 Железобетонно |
+| 139 | Gate visibility: zone_type==3 → DGS curve, else → simple line | 🔒 Железобетонно |
+| 140 | Cursor line: puntir between gates, y = -height/2 (marker defect position) | 🔒 Железобетонно |
+| 141 | FUN_004164c5: BitBlt SRCCOPY (0xCC0020), -height inversion | 🔒 Железобетонно |
+| 142 | Distance formula: val×(240>>shift)/(scale×divider) | 🔒 Железобетонно |
+
+---
