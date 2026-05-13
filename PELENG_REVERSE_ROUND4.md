@@ -1299,3 +1299,169 @@ DGS_Object* CreateDGS(uint32_t* templateData) {
 | 110 | FUN_0040da36: полный pipeline инициализации (6 шагов) | 🔒 Железобетонно |
 
 ---
+
+
+
+## 27. Deflate/LZ77 Compressor — B-scan сжатие
+
+### 27.1 Назначение
+
+B-scan данные (3840 или 4800 байт 1-bit bitmap) сжимаются стандартным **Deflate (RFC 1951)** перед записью в PROTOCOL BLOB. Это **тот же** алгоритм что используется в zlib/gzip/PNG.
+
+### 27.2 Структура компрессора (5816+ байт)
+
+| Offset | Размер | Поле | Описание |
+|--------|--------|------|----------|
+| +0x0008 | 4 | output_buf | Указатель на выходной буфер |
+| +0x000C | 4 | input_data | Указатель на входные данные |
+| +0x0010 | 4 | input_size | Размер входных данных |
+| +0x0014 | 4 | output_pos | Текущая позиция записи |
+| +0x008C | 572 | lit_freq[286] | Частоты литералов (short×286) |
+| +0x0980 | 60 | dist_freq[30] | Частоты расстояний (short×30) |
+| +0x0A74 | 38 | bitlen_freq[19] | Частоты длин кодов (short×19) |
+| +0x0B14 | 4 | lit_count | Количество литеральных кодов |
+| +0x0B20 | 4 | dist_count | Количество distance-кодов |
+| +0x0B34 | 32 | code_buf[16] | Буфер кодов (short×16) |
+| +0x0B54 | 2296 | heap[574] | Куча для Huffman (int×574) |
+| +0x1448 | 4 | heap_size | Размер кучи |
+| +0x144C | 4 | heap_max | Максимальный индекс |
+| +0x1450 | 574 | depth[574] | Глубина узлов (byte×574) |
+| +0x1690 | 4 | pending_buf | Буфер ожидания (byte[]) |
+| +0x1698 | 4 | pending_count | Элементов в ожидании |
+| +0x169C | 4 | pending_codes | Коды ожидания (short[]) |
+| +0x16A0 | 4 | total_bits | Всего записано бит |
+| +0x16A4 | 4 | secondary_bits | Вторичный счётчик бит |
+| +0x16AC | 4 | bits_per_code | Бит на символ (=8) |
+| +0x16B0 | 2 | bit_buffer | 16-бит буфер (текущий) |
+| +0x16B4 | 4 | bits_in_buffer | Бит в буфере |
+
+### 27.3 Функции компрессора
+
+| Функция | RVA | Назначение |
+|---------|-----|-----------|
+| FUN_0046f9ec | 0x0046f9ec | Reset: обнуление частотных таблиц |
+| FUN_0046fbdc | 0x0046fbdc | Heap sift-down (приоритетная очередь) |
+| FUN_0046fccc | 0x0046fccc | Build Huffman tree из частот |
+| FUN_00470e2c | 0x00470e2c | Dynamic block header (HLIT, HDIST, HCLEN) |
+| FUN_004710bc | 0x004710bc | Stored block (некомпрессированный fallback) |
+| FUN_004715cc | 0x004715cc | Encode symbols (Huffman bitstream writer) |
+| FUN_00471c2c | 0x00471c2c | Flush (завершение блока, final bit) |
+
+### 27.4 Статические таблицы
+
+```
+DAT_0051bd80: Fixed literal Huffman codes (стандарт RFC 1951 §3.2.6)
+DAT_0051bc80: Fixed distance Huffman codes (стандарт RFC 1951 §3.2.6)
+```
+
+### 27.5 Поток обработки B-scan
+
+```
+1. Raw B-scan bitmap (3840/4800 bytes, 1-bit/pixel)
+     ↓
+2. LZ77 sliding window matching (FUN_0047115c et al)
+     ↓
+3. Huffman encoding (FUN_004715cc)
+     ↓
+4. Bitstream output → compressed BLOB
+     ↓
+5. Записывается в PROTOCOL столбец RESULTS2/BLOCKZAP
+```
+
+### 27.6 Связь с DGS_Settings расширением
+
+Расширение шаблона (+0x1668..+0x1CD8) = **НЕ DGS-кривая**, а **рабочее состояние Deflate-компрессора**! Поля +0x1690..+0x16B4 — это pending buffer, bit accumulator и т.д. компрессора.
+
+---
+
+## 28. WordML Report Generator — полная схема
+
+### 28.1 Структура XML-документа
+
+```xml
+<?xml version="1.0" encoding="windows-1251"?>
+<?mso-application progid="Word.Document"?>
+<w:wordDocument
+    xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml"
+    xmlns:v="urn:schemas-microsoft-com:vml"
+    xmlns:w10="http://schemas.microsoft.com/office/word/2003/auxHint"
+    xmlns:sl="http://schemas.microsoft.com/schemaLibrary/2003/core"
+    xmlns:aml="http://schemas.microsoft.com/aml/2001/core"
+    xmlns:wx="urn:schemas-microsoft-com:office:word"
+    xmlns:o="urn:schemas-microsoft-com:office:office"
+    xmlns:dt="uuid:C2F41010-65B3-11d1-A29F-00AA00C14882">
+  <w:body>
+    <wx:sect>
+      <w:sectPr>
+        <w:pgSz w:w="11906" w:h="16838"/>  <!-- A4 portrait -->
+        <w:cols w:num="2"/>                  <!-- 2 колонки -->
+        <w:type w:val="continuous"/>
+      </w:sectPr>
+      <!-- Field data table -->
+      <!-- A-scan image (protPict.png) -->
+      <!-- B-scan image (if present) -->
+    </wx:sect>
+  </w:body>
+</w:wordDocument>
+```
+
+### 28.2 Генерация полей (FUN_00424d9c)
+
+```c
+for (idx = 0; idx < field_count; idx++) {
+    // Проверка видимости:
+    if (fields[idx].visibility_callback != 0) {
+        if (fields[idx].visibility_callback(raw_data) == 0) {
+            fields[idx].type_code = 0xFF;  // скрыть
+            continue;
+        }
+    }
+    
+    // Создание CEdit для редактируемых полей:
+    if (type in {0x24, 0x25, 0x26, 0x2C, 0x36, 0x4D}) {
+        CEdit* edit = new CEdit(...);
+        edit->SetWindowText(decoded_value);
+        map.SetAt(fields[idx].name, edit);
+    }
+}
+```
+
+### 28.3 Размеры отчёта
+
+| Параметр | Значение |
+|----------|----------|
+| Страница | A4 (11906×16838 twips = 210×297 мм) |
+| Ширина столбца | DAT_0051cb4c px |
+| Шаг между столбцами | DAT_0051cb50 px |
+| Высота строки | DAT_0051cb2c = 13 px |
+| Ширина A-scan графика | 280 px (отрисовка), 240pt (WordML) |
+| Высота A-scan графика | 200 px (отрисовка), 120pt (WordML) |
+| Масштаб X | width / 244 ≈ 1.15 |
+| Масштаб Y | height / 140 ≈ 1.43 |
+
+---
+
+## 29. Итоговая сводка (110+ находок)
+
+| # | Находка | Статус |
+|---|---------|--------|
+| 101 | A-scan = 244 байта, 1 byte/sample (0-255) | 🔒 |
+| 102 | Область отрисовки: 280×200 px, scale 280/244 | 🔒 |
+| 103 | Сетка: мелкая через 4, крупная через 12 сэмплов | 🔒 |
+| 104 | DGS object: vtable+20+1648, defaults range=300 | 🔒 |
+| 105 | DAT_00515ea0 = scale 1 или 2 (из DGS byte +0x66C) | 🔒 |
+| 106 | Display mode стандарт: 7 единиц (мм,мкс,дБ,%,м/с,°,пусто) | 🔒 |
+| 107 | Display mode расш.: +МГц, мм/мкс, дБ/мм | 🔒 |
+| 108 | A-scan render: CDC::LineTo × 244, Y через callback | 🔒 |
+| 109 | Field array: stride 7 dwords, visibility callback | 🔒 |
+| 110 | B-scan compression = standard Deflate (RFC 1951) | 🔒 |
+| 111 | Deflate state: 5816+ bytes (+0x08..+0x16B4) | 🔒 |
+| 112 | 7 Deflate functions (reset, sift, build, header, stored, encode, flush) | 🔒 |
+| 113 | Static Huffman tables: DAT_0051bd80/bc80 | 🔒 |
+| 114 | Template extension = Deflate compressor state (NOT DGS curve!) | 🔒 |
+| 115 | WordML: A4, encoding=windows-1251, 9 xmlns declarations | 🔒 |
+| 116 | Report layout: 2 columns, row height 13px, continuous section | 🔒 |
+| 117 | Field visibility: callback-based (0=always, ptr=conditional) | 🔒 |
+| 118 | Hidden field marker: type_code set to 0xFF | 🔒 |
+
+---
