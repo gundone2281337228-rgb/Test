@@ -1642,3 +1642,162 @@ void InitAScanBitmap(int* param_1) {
 | 128 | 6 CRT math (exp, log10, sqrt, fabs, memcpy, ftol) | 🔒 Железобетонно |
 
 ---
+
+
+## 37. FUN_0040b7fd — Universal DGS Field Decoder (43 типа)
+
+### Структура DGS-поля (stride = 12 байт = 0x0C):
+```
+DGS_Field[i]:
+  [i*12 + 0x18] = name/label string pointer
+  [i*12 + 0x1C] = data_offset (in raw body для ReadByte/ReadLE16/Real48)
+  [i*12 + 0x20] = type_code (case 0x00..0x4C)
+```
+
+### Полная таблица типов (43 case):
+
+| Case | Имя | Декодирование |
+|------|-----|---------------|
+| 0x00 | STRING | Строка из ptr (с пробелами каждые 2 символа) |
+| 0x01 | REAL48_3 | Real48 → "%.3f" |
+| 0x02 | REAL48_2 | Real48 → "%.2f" |
+| 0x03 | REAL48_1 | Real48 → "%.1f" |
+| 0x04 | LE16_INT | ReadLE16 → "%d" |
+| 0x07 | SHAPE_TYPE | ReadByte: 0="Круг", 1="Прямоуг.", 2="Эллипс" |
+| 0x08 | PASSPORT_8 | Passport(offset, 8) → LUT decode 8 символов |
+| 0x09 | BOOL_A | ReadByte: 0="Нет", else="Да" |
+| 0x0A | SCALE_MODE | scaleFn(): 1.25/0.62→"Режим A", else→"Режим B" |
+| 0x0B | LOOKUP_A | ReadByte → table[+0x4CC + val*4] (режим работы) |
+| 0x0C | LOOKUP_B | ReadByte → table[+0x51C + val*4] (параметр) |
+| 0x0D | BYTE_FMT | ReadByte → "%d" |
+| 0x0E | PROBE_TYPE | ReadByte: 0/1/2/else → 4 типа ПЭП |
+| 0x0F | BYTE_FMT2 | ReadByte → format 2 |
+| 0x10 | LE16_5DIG | ReadLE16 → "%05d" |
+| 0x11 | LE16_DIV10 | ReadLE16/10 → дробное |
+| 0x12 | DISTANCE | `val×(0xF0>>shift) / (scale×divider)` → мм |
+| 0x13 | TIME | `ReadLE16 / DAT_0051cb44` → мкс |
+| 0x14 | SCAN_TYPE | ReadByte: 0..4 → 5 типов сканирования |
+| 0x15 | ON_OFF | ReadByte: 0="Вкл", else="Выкл" |
+| 0x16 | SQRT_REAL48 | Real48 → √x |
+| 0x17 | BOOL_B | ReadByte: 0="стр1", else="стр2" |
+| 0x18 | CTRL_TYPE | ReadByte: 0..7 → 8 типов контроля |
+| 0x19 | MODE_4 | ReadByte: 0..3 → 4 режима |
+| 0x1A | BIT_A | TestBit(+8, mask) → "Да"/"Нет" |
+| 0x1B | BIT_B | TestBit(+0x10, mask) → "Да"/"Нет" |
+| 0x1C | STRING_UC | Строка из ptr (UPPERCASE) |
+| 0x1D | BSCAN_TYPE | ReadByte: 0..4 → "BC1"/"BC2"/"BC1+BC2"/... |
+| 0x1E | LE16_FMT3 | ReadLE16 → format 3 |
+| 0x1F | BYTE_FMT3 | ReadByte → format 3 |
+| 0x20 | BIT_C | TestBit(+0xC, mask) → стр1/стр2 |
+| 0x22 | DISPLAY | ReadByte → callback(+0x66C) = единицы измерения |
+| 0x23 | LOOKUP_C | ReadByte → table[+0x610 + val*4] |
+| 0x2E | SIDE_3 | ReadByte: 0/1/2 → 3 стороны |
+| 0x35 | SIGNED16 | ReadLE16 → signed short |
+| 0x38 | ANGLE | ReadByte: >0x7F → -(256-val) градусов |
+| 0x40 | BIT_D | TestBit(+0x10, mask) → стр1/стр2 |
+| 0x44 | REAL48 | Real48 → format |
+| 0x46 | FLAG_4 | ReadByte & 4: 0→A, else→B |
+| 0x47 | FLAG_2 | ReadByte & 2: 0→A, else→B |
+| 0x48 | MODE_4B | ReadByte: 0..3 → 4 строки |
+| 0x49 | FLAG_8 | ReadByte & 8: 0→A, else→B |
+| 0x4C | MODE_N | ReadByte: 0..5+ → N строк |
+
+### Lookup tables в DGS объекте:
+```
++0x4CC: string_table_1[N] — N строк режимов работы
++0x51C: string_table_2[N] — N строк параметров  
++0x610: string_table_3[N] — N строк доп. режимов
++0x660: mode_byte_offset — используется для вычисления расстояния
+```
+
+---
+
+## 38. FUN_0040c7d4 — HTML report generator (settings display)
+
+Генерирует HTML-таблицу настроек прибора:
+
+```html
+<table border=0 align='center'>
+  <tr><td><b>Заголовок</b></td></tr>     <!-- case 0 -->
+  <tr><td>Имя</td><td>Значение</td></tr> <!-- default -->
+  </table></td><td><table border=0      <!-- при достижении середины -->
+</tr></table></table>                     <!-- конец -->
+```
+
+Цикл по DGS-полям:
+- Проверяет type_code: 0x1C = разделитель (новая подтаблица)
+- Для остальных: вызывает FUN_0040b7fd → получает строку → вставляет в `<td>`
+- При достижении `count/2` → переход на второй столбец
+
+---
+
+## 39. FUN_0040d02b — WordML body builder (полная структура)
+
+Создаёт XML-структуру `<w:body><wx:sect>...<w:sectPr>`:
+
+```xml
+<w:body>
+  <wx:sect>
+    <!-- Для каждого DGS-поля (stride 12): -->
+    <w:p>
+      <w:pPr>...</w:pPr>
+      <w:r>
+        <w:rPr><w:u w:val="single"/></w:rPr>  <!-- case 0: подчёркнутый -->
+        <w:t>field_value</w:t>
+      </w:r>
+    </w:p>
+    <!-- ИЛИ обычный параграф без подчёркивания -->
+    
+    <w:sectPr>
+      <w:cols w:num="2"/>
+      <w:pgSz w:w="11906" w:h="16838"/>
+    </w:sectPr>
+  </wx:sect>
+</w:body>
+```
+
+Field display type (this + field*12 + 0x80):
+- **0x00** = заголовок (bold, underline)
+- **0x1C** = разделитель секций (пустой параграф)
+- **другое** = обычное поле (label + value)
+
+---
+
+## 40. Report Pipeline — полная сводка (из кода)
+
+```
+Пользователь нажимает "Отчёт" в zapis2.exe:
+  ↓
+FUN_00405832 → FUN_004151ea (Print/Preview entry point)
+  ├─ FUN_00416377 → redraw all fields (GDI rendering for preview)
+  │   ├─ FUN_0040afd1 → draw DGS fields (text labels + values)
+  │   ├─ FUN_00404fd3 → draw dual-channel envelope (240×2 pts)
+  │   └─ FUN_00405236 → draw A-scan + gates + DGS curve
+  ├─ FUN_004164c5 → B-scan widget update (if present)
+  │   ├─ FUN_00419064 → CreateFromHBITMAP → Save PNG
+  │   └─ embedded into WordML as base64
+  └─ FUN_004168de → finalize report (save .doc)
+      ├─ FUN_0040d02b → build WordML XML body
+      │   ├─ FUN_0040b7fd × N → decode each DGS field
+      │   └─ XML: <w:body><wx:sect>...<w:sectPr>
+      └─ FUN_0040c7d4 → build HTML preview table
+          ├─ FUN_0040b7fd × N → decode each field
+          └─ HTML: <table>...<td>values</td>...</table>
+```
+
+---
+
+## 41. Сводка (раунд 4 финальная — 136 находок)
+
+| # | Находка | Статус |
+|---|---------|--------|
+| 129 | FUN_0040b7fd: 43-case Universal DGS Decoder (stride 12) | 🔒 Железобетонно |
+| 130 | DGS field stride = 12 bytes (NOT 28 like template fields!) | 🔒 Железобетонно |
+| 131 | 3 string lookup tables в DGS: +0x4CC, +0x51C, +0x610 | 🔒 Железобетонно |
+| 132 | Distance formula: val×(0xF0>>shift)/(scale×divider) | 🔒 Железобетонно |
+| 133 | Time formula: ReadLE16 / DAT_0051cb44 → мкс | 🔒 Железобетонно |
+| 134 | FUN_0040c7d4: HTML table generator for settings | 🔒 Железобетонно |
+| 135 | FUN_0040d02b: WordML body builder (<w:body><wx:sect>) | 🔒 Железобетонно |
+| 136 | Full report pipeline: 8 functions in sequence | 🔒 Железобетонно |
+
+---
