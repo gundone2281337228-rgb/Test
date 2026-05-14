@@ -1384,21 +1384,65 @@ class BlockZapDB:
                     password='masterkey',
                     charset='WIN1251'
                 )
-            except Exception:
+            except Exception as e1:
                 # Если не сработало -- попробуем указать путь к embedded
+                LOG.warning("fdb.connect без load_api не удался: %s", e1)
                 fb_lib = None
-                for candidate in [
+                # Формируем расширенный список путей для поиска fbclient/fbembed
+                import shutil
+                search_paths = [
                     os.environ.get('PELENG_FBCLIENT', ''),
+                    # Рядом с .fdb файлом
+                    str(Path(fdb_path).parent / 'fbembed.dll'),
+                    str(Path(fdb_path).parent / 'fbclient.dll'),
+                    # Рядом с нашим скриптом
+                    str(Path(__file__).parent / 'fbembed.dll'),
+                    str(Path(__file__).parent / 'fbclient.dll'),
+                    # В каталоге пользователя .peleng_clone
+                    str(Path.home() / '.peleng_clone' / 'fbembed.dll'),
+                    str(Path.home() / '.peleng_clone' / 'fbclient.dll'),
                     str(Path.home() / '.peleng_clone' / 'fb25' / 'fbembed.dll'),
-                    'fbembed.dll', 'fbclient.dll',
-                    '/usr/lib/libfbembed.so.2.5',
-                    '/usr/lib/x86_64-linux-gnu/libfbclient.so',
-                ]:
+                    str(Path.home() / '.peleng_clone' / 'fb25' / 'fbclient.dll'),
+                ]
+                # На Windows проверяем стандартные пути установки Firebird
+                if sys.platform == 'win32':
+                    # shutil.which на Windows
+                    which_embed = shutil.which('fbembed.dll')
+                    which_client = shutil.which('fbclient.dll')
+                    if which_embed:
+                        search_paths.append(which_embed)
+                    if which_client:
+                        search_paths.append(which_client)
+                    # Стандартные пути Firebird на Windows
+                    for fb_ver in ('Firebird_2_5', 'Firebird_3_0', 'Firebird_2_1'):
+                        for prog_dir in (r'C:\Program Files', r'C:\Program Files (x86)'):
+                            search_paths.append(
+                                os.path.join(prog_dir, 'Firebird', fb_ver, 'bin', 'fbclient.dll'))
+                            search_paths.append(
+                                os.path.join(prog_dir, 'Firebird', fb_ver, 'fbembed.dll'))
+                    # WoW64 / bin
+                    search_paths.append(r'C:\Firebird\bin\fbclient.dll')
+                    search_paths.append(r'C:\Firebird\fbembed.dll')
+                else:
+                    # Linux пути
+                    search_paths.extend([
+                        '/usr/lib/libfbembed.so.2.5',
+                        '/usr/lib/libfbembed.so',
+                        '/usr/lib/x86_64-linux-gnu/libfbclient.so',
+                        '/usr/lib/x86_64-linux-gnu/libfbclient.so.2',
+                        '/opt/firebird/lib/libfbclient.so',
+                        '/opt/firebird/lib/libfbembed.so',
+                    ])
+                for candidate in search_paths:
                     if candidate and os.path.isfile(candidate):
                         fb_lib = candidate
                         break
                 if not fb_lib:
-                    raise ImportError("fbclient не найден")
+                    raise ImportError(
+                        f"fbclient/fbembed не найден. Первая ошибка: {e1}\n"
+                        f"Проверенные пути:\n" +
+                        "\n".join(f"  - {p}" for p in search_paths if p))
+                LOG.info("Найдена библиотека Firebird: %s", fb_lib)
                 if getattr(_fdb, 'api', None) is None:
                     _fdb.load_api(fb_lib)
                 conn = _fdb.connect(
@@ -1944,8 +1988,10 @@ def _create_gui_classes():
             self._init_toolbar()
             self._init_statusbar()
 
-            # Открываем БД в памяти по умолчанию
-            self._db = BlockZapDB()
+            # Открываем БД в файле пользователя (персистентное хранение)
+            _db_path = str(Path.home() / '.peleng_clone' / 'blockzap.sqlite3')
+            Path(_db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._db = BlockZapDB(_db_path)
 
         def _init_ui(self) -> None:
             """Инициализация основного интерфейса с тремя вкладками."""
@@ -2348,6 +2394,8 @@ def _create_gui_classes():
 
         def _action_receive(self) -> None:
             """Действие: Принять данные от прибора (F5) -- полный приём по каталогу."""
+            # Счётчик для обновления таблиц в реальном времени
+            self._recv_count = 0
             # Открываем порт при необходимости
             if not self._port:
                 self._port = PelengPort(self._port_config)
@@ -2406,6 +2454,10 @@ def _create_gui_classes():
                     if tlv:
                         decoded = dispatch_decode(tlv)
                         self._db.upsert(decoded, tlv.raw)
+                # Обновляем таблицы каждые 10 записей для live-отображения
+                self._recv_count += 1
+                if self._recv_count % 10 == 0:
+                    self._refresh_tables()
             except Exception as exc:
                 LOG.error("Ошибка обработки записи при приёме: %s", exc)
 
@@ -2521,7 +2573,20 @@ def _create_gui_classes():
             if path and self._db:
                 self._statusbar.showMessage("\u0418\u043c\u043f\u043e\u0440\u0442...")
                 QApplication.processEvents()
-                count = self._db.import_fdb(path)
+                try:
+                    count = self._db.import_fdb(path)
+                except Exception as import_exc:
+                    LOG.error("Ошибка импорта FDB: %s", import_exc)
+                    self._statusbar.showMessage("Ошибка импорта FDB")
+                    QMessageBox.critical(self, "\u041e\u0448\u0438\u0431\u043a\u0430 \u0438\u043c\u043f\u043e\u0440\u0442\u0430 FDB",
+                        f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0444\u0430\u0439\u043b:\n{path}\n\n"
+                        f"\u041e\u0448\u0438\u0431\u043a\u0430: {import_exc}\n\n"
+                        "\u0420\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u0430\u0446\u0438\u0438:\n"
+                        "\u2022 \u041f\u043e\u043b\u043e\u0436\u0438\u0442\u0435 fbembed.dll \u0440\u044f\u0434\u043e\u043c \u0441 .fdb \u0444\u0430\u0439\u043b\u043e\u043c\n"
+                        "\u2022 \u0418\u043b\u0438 \u0432 \u043f\u0430\u043f\u043a\u0443 ~/.peleng_clone/\n"
+                        "\u2022 \u0418\u043b\u0438 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0435 Firebird 2.5 Embedded\n"
+                        "\u2022 \u0418\u043b\u0438 \u0437\u0430\u0434\u0430\u0439\u0442\u0435 PELENG_FBCLIENT=\u043f\u0443\u0442\u044c")
+                    return
                 self._refresh_tables()
                 file_size = Path(path).stat().st_size
                 if count > 0:
