@@ -2076,6 +2076,8 @@ def _create_gui_classes():
             # ВСЕ записи из BlockZap (от прибора через UART или TLV-парсинг)
             for rec in self._db.all_records():
                 rows.append({
+                    "id": rec.get("id"),
+                    "_blockzap_id": rec.get("id"),
                     "addr": rec.get("block_addr", rec.get("sweep_addr", rec.get("id", 0))),
                     "date_str": rec.get("date_str", ""),
                     "time_str": rec.get("time_str", ""),
@@ -2156,6 +2158,8 @@ def _create_gui_classes():
             # Записи SHORT_PROTO/GENERIC/UNKNOWN из BlockZap
             for rec in self._db.filter_reports():
                 rows.append({
+                    "id": rec.get("id"),
+                    "_blockzap_id": rec.get("id"),
                     "addr": rec.get("block_addr", rec.get("id", 0)),
                     "date_str": rec.get("date_str", ""),
                     "time_str": rec.get("time_str", ""),
@@ -2231,6 +2235,8 @@ def _create_gui_classes():
             # Записи CALIBRATION/SETTINGS из BlockZap
             for rec in self._db.filter_settings():
                 rows.append({
+                    "id": rec.get("id"),
+                    "_blockzap_id": rec.get("id"),
                     "addr": rec.get("block_addr", rec.get("id", 0)),
                     "date_str": rec.get("date_str", ""),
                     "time_str": rec.get("time_str", ""),
@@ -2932,21 +2938,37 @@ def _handle_protocol_double_click(window, row: int) -> None:
         return
     if not window._db:
         return
-    id_item = window._tbl_protocols.item(row, 0)
-    if not id_item:
+    item = window._tbl_protocols.item(row, 0)
+    if not item:
         return
-    rec_id = int(id_item.text())
-    blob = window._db.get_block(rec_id)
-    if not blob:
+    row_data = item.data(Qt.ItemDataRole.UserRole)
+    if not row_data:
         return
-    # Разбираем TLV
-    tlv = TLVRecord.parse(blob)
-    if not tlv:
-        return
-    decoded = dispatch_decode(tlv)
-    # Открываем комбинированное окно граф+расшифровка
-    dlg = GraphDecryptionWindow(window, decoded)
-    dlg.exec()
+    # Пробуем получить BLOB из BlockZap
+    rec_id = row_data.get("id") or row_data.get("_blockzap_id")
+    blob = None
+    if rec_id:
+        try:
+            blob = window._db.get_block(int(rec_id))
+        except (ValueError, TypeError):
+            pass
+    if blob:
+        tlv = TLVRecord.parse(blob)
+        if tlv:
+            decoded = dispatch_decode(tlv)
+            GraphDecryptionWindowCls = _create_graph_decryption_window()
+            if GraphDecryptionWindowCls:
+                dlg = GraphDecryptionWindowCls(window, decoded)
+                dlg.exec()
+            return
+    # Fallback: показываем расшифровку полей из row_data
+    DecryptionDialogCls, _, _ = _create_dialog_classes()
+    if DecryptionDialogCls:
+        rec = DecodedRecord()
+        rec.fields = dict(row_data) if row_data else {}
+        rec.category_name = row_data.get("type_name", "") if row_data else ""
+        dlg = DecryptionDialogCls(window, rec)
+        dlg.exec()
 
 
 def _handle_report_double_click(window, row: int) -> None:
@@ -2955,42 +2977,74 @@ def _handle_report_double_click(window, row: int) -> None:
         return
     if not window._db:
         return
-    id_item = window._tbl_reports.item(row, 0)
-    if not id_item:
+    item = window._tbl_reports.item(row, 0)
+    if not item:
         return
-    rec_id = int(id_item.text())
-    blob = window._db.get_block(rec_id)
-    if not blob:
+    row_data = item.data(Qt.ItemDataRole.UserRole)
+    if not row_data:
         return
-    tlv = TLVRecord.parse(blob)
-    if not tlv:
-        return
-    decoded = dispatch_decode(tlv)
-    # Открываем диалог расшифровки
-    dlg = DecryptionDialog(window, decoded)
-    dlg.exec()
+    rec_id = row_data.get("id") or row_data.get("_blockzap_id")
+    blob = None
+    if rec_id:
+        try:
+            blob = window._db.get_block(int(rec_id))
+        except (ValueError, TypeError):
+            pass
+    if blob:
+        tlv = TLVRecord.parse(blob)
+        if tlv:
+            decoded = dispatch_decode(tlv)
+            DecryptionDialogCls, _, _ = _create_dialog_classes()
+            if DecryptionDialogCls:
+                dlg = DecryptionDialogCls(window, decoded)
+                dlg.exec()
+            return
+    # Fallback для FDB записей
+    DecryptionDialogCls, _, _ = _create_dialog_classes()
+    if DecryptionDialogCls:
+        rec = DecodedRecord()
+        rec.fields = dict(row_data) if row_data else {}
+        rec.category_name = row_data.get("type_name", "") if row_data else ""
+        dlg = DecryptionDialogCls(window, rec)
+        dlg.exec()
 
 
 def _handle_settings_double_click(window, row: int) -> None:
-    """Обработчик двойного клика по строке настроек: детальный просмотр."""
+    """Обработчик двойного клика по строке настроек."""
     if not _PYQT_AVAILABLE:
         return
     if not window._db:
         return
-    id_item = window._tbl_settings.item(row, 0)
-    if not id_item:
+    item = window._tbl_settings.item(row, 0)
+    if not item:
         return
-    rec_id = int(id_item.text())
-    blob = window._db.get_block(rec_id)
-    if not blob:
+    row_data = item.data(Qt.ItemDataRole.UserRole)
+    if not row_data:
         return
-    tlv = TLVRecord.parse(blob)
-    if not tlv:
-        return
-    decoded = dispatch_decode(tlv)
-    # Открываем детальный диалог настроек
-    dlg = SettingsDetailDialog(window, decoded)
-    dlg.exec()
+    rec_id = row_data.get("id") or row_data.get("_blockzap_id")
+    blob = None
+    if rec_id:
+        try:
+            blob = window._db.get_block(int(rec_id))
+        except (ValueError, TypeError):
+            pass
+    if blob:
+        tlv = TLVRecord.parse(blob)
+        if tlv:
+            decoded = dispatch_decode(tlv)
+            _, SettingsDetailDialogCls, _ = _create_dialog_classes()
+            if SettingsDetailDialogCls:
+                dlg = SettingsDetailDialogCls(window, decoded)
+                dlg.exec()
+            return
+    # Fallback
+    DecryptionDialogCls, _, _ = _create_dialog_classes()
+    if DecryptionDialogCls:
+        rec = DecodedRecord()
+        rec.fields = dict(row_data) if row_data else {}
+        rec.category_name = "SETTINGS"
+        dlg = DecryptionDialogCls(window, rec)
+        dlg.exec()
 
 
 
