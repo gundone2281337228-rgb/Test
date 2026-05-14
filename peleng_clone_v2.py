@@ -520,48 +520,379 @@ class UD2_102Port(PelengPort):
                 return reply
             return None
 
-    def read_record(self, addr_lo: int, addr_hi: int) -> Optional[bytes]:
-        """Чтение одной записи по адресу из flash UD2-102."""
+    def read_record(self, addr: int) -> Optional[bytes]:
+        """Чтение одной записи по адресу из flash UD2-102.
+
+        Протокол: 0x42 + addr_lo + addr_hi -> 2 байта заголовка.
+        Если заголовок == 0xFD 0xFF или 0xFF 0xFF -- пустой блок (None).
+        Иначе дочитываем 84 байта тела. Возвращает 86 байт (2 header + 84 body).
+        """
         with self._lock:
             if not self.is_open:
                 return None
+            addr_lo = addr & 0xFF
+            addr_hi = (addr >> 8) & 0xFF
             self._send_byte(OP_BLOCK_READ)
             self._send_byte(addr_lo)
             self._send_byte(addr_hi)
-            # Сначала читаем 4 байта TLV header
-            hdr = self._read_bytes(TLV_HEADER_SIZE)
-            if len(hdr) < TLV_HEADER_SIZE:
+            # Читаем 2 байта заголовка записи
+            head = self._read_bytes(2)
+            if len(head) < 2:
                 return None
-            tag = struct.unpack_from('<H', hdr, 0)[0]
-            length = struct.unpack_from('<H', hdr, 2)[0]
-            if tag == TLV_PADDING_TAG or length == 0:
+            # Проверка маркеров пустого блока
+            if head in (b"\xFD\xFF", b"\xFF\xFF"):
                 return None
-            body = self._read_bytes(length)
-            return hdr + body
+            # Дочитываем 84 байта тела
+            body = self._read_bytes(84)
+            if len(body) < 84:
+                return None
+            return head + body
 
-    def scan_memory(self, start_addr: int = 0, end_addr: int = 0xFFFF,
-                    callback: Optional[Callable[[int, int], None]] = None) -> List[bytes]:
-        """Сканирование памяти прибора UD2-102 с контролем непрерывных блоков."""
+    def scan_memory(self, bases: Optional[Tuple[int, ...]] = None,
+                    indices_per_base: int = 100,
+                    callback: Optional[Callable] = None) -> List[bytes]:
+        """Сканирование памяти прибора UD2-102 с base+streak алгоритмом.
+
+        Для каждой базы (10100, 10200, ..., 13400) перебирает индексы 0..99.
+        Streak-контроль:
+          - 15 пустых подряд до первого хита -> переход к следующей базе;
+          -  2 пустых подряд после первого хита -> переход к следующей базе.
+        """
+        if bases is None:
+            bases = UD2_BASES
         records: List[bytes] = []
-        self._streak_count = 0
-        addr = start_addr
-        while addr <= end_addr:
-            lo = addr & 0xFF
-            hi = (addr >> 8) & 0xFF
-            rec = self.read_record(lo, hi)
-            if rec is None:
-                self._streak_count += 1
-                if self._streak_count >= self._max_streak:
-                    LOG.info("scan_memory: прервано после %d пустых адресов", self._max_streak)
-                    break
-            else:
-                self._streak_count = 0
-                records.append(rec)
-            addr += 1
-            if callback:
-                callback(addr, end_addr)
+        total_addrs = len(bases) * indices_per_base
+        processed = 0
+        for base in bases:
+            seen_hit = False
+            empty_streak = 0
+            for idx in range(indices_per_base):
+                addr = base + idx
+                rec = self.read_record(addr)
+                processed += 1
+                if rec is None:
+                    empty_streak += 1
+                    limit = UD2_STREAK_AFTER_HIT if seen_hit else UD2_STREAK_NO_HITS
+                    if empty_streak >= limit:
+                        LOG.info("scan_memory: база %d -- обрыв по %d пустых",
+                                 base, empty_streak)
+                        break
+                else:
+                    empty_streak = 0
+                    seen_hit = True
+                    records.append(rec)
+                if callback:
+                    callback(processed, total_addrs)
         return records
 
+
+# ============= 2B. UD2-102 BCD CONSTANTS AND UTILITIES =============
+
+# Размеры записи
+UD2_RECORD_BYTES: int = 84
+UD2_RECORD_HEADER_BYTES: int = 2
+
+# Базы адресов памяти прибора (каждая -- начало сектора из 100 записей)
+UD2_BASES: Tuple[int, ...] = (10100, 10200, 10300, 10400, 10500, 10600, 13300, 13400)
+UD2_INDICES_PER_BASE: int = 100
+
+# Streak-контроль: управление прерыванием обхода базы
+UD2_STREAK_NO_HITS: int = 15     # 15 пустых подряд до первого хита -> следующая база
+UD2_STREAK_AFTER_HIT: int = 2    # 2 пустых подряд после первого хита -> следующая база
+
+# Маркеры пустых/стертых блоков (2 байта заголовка)
+UD2_EMPTY_MARKERS: Tuple[bytes, ...] = (b"\xFD\xFF", b"\xFF\xFF")
+
+# Эталонный радиус оси (для V-тракта)
+UD2_DEFAULT_RAXLE_MM: float = 65.0
+
+
+def reverse_bcd(buf: bytes, length: Optional[int] = None) -> str:
+    """Декодирует Reverse BCD: каждый байт = 2 цифры (hi|lo nibble),
+    байты идут в обратном порядке, ведущие нули отсекаются, терминатор 0x0A.
+
+    Например: bytes([0x12, 0x34, 0x0A]) -> "3412".
+    """
+    if length is not None:
+        buf = buf[:length]
+    digits: List[str] = []
+    for b in reversed(buf):
+        if b == 0x0A:
+            # Терминатор: если уже набрали цифры -- стоп.
+            # Если ещё нет цифр -- пропускаем (может быть trailing 0x0A).
+            if digits:
+                break
+            continue
+        hi = (b >> 4) & 0xF
+        lo = b & 0xF
+        if hi <= 9:
+            digits.append(str(hi))
+        if lo <= 9:
+            digits.append(str(lo))
+    s = "".join(digits).lstrip("0")
+    return s
+
+
+def is_valid_date_anchor(b: bytes, i: int) -> bool:
+    """5 байт валидной даты: day(1..31), month(1..12), year(15..40),
+    hour(0..23), minute(0..59). Используется для поиска плавающего якоря
+    BCD-паспорта внутри 84-байтного тела записи УД2-102.
+    """
+    if i < 0 or i + 5 > len(b):
+        return False
+    d, m, y, h, mn = b[i], b[i + 1], b[i + 2], b[i + 3], b[i + 4]
+    return (1 <= d <= 31 and 1 <= m <= 12 and 15 <= y <= 40
+            and h <= 23 and mn <= 59)
+
+
+def decode_side(side_byte: int) -> str:
+    """Декодирует байт стороны: 0=Левая, 1=Правая."""
+    return {0: "Левая", 1: "Правая"}.get(side_byte, f"?({side_byte})")
+
+
+def decode_sheika(sheika_byte: int) -> str:
+    """Декодирует байт шейки: 1=С кольцами, 2=С буксой, иначе Открытая."""
+    return {1: "С кольцами", 2: "С буксой"}.get(sheika_byte, "Открытая")
+
+
+def decode_naplavka(byte_val: int) -> str:
+    """Декодирует байт наплавки."""
+    return {0x01: "Восстановлена наплавкой", 0x00: "Без наплавки"}.get(byte_val, "\u2014")
+
+
+# Полный словарь TYPEVAR (реверс zapis2.exe + 102_203dll.dll)
+# Ключ -- пара (tcode, sub_b). Если sub_b=None -- sub-байт игнорируется.
+TYPEVAR_DICT: Dict[Tuple[int, Optional[int]], str] = {
+    # Железнодорожная (Version2)
+    (24667, 1):    "Ось РУ1",
+    (24667, 0):    "Ось РУ1Ш",
+    (57435, 1):    "Ось РУ1",
+    (57435, 0):    "Ось РУ1Ш",
+    (24668, 1):    "Ось РВ2Ш",
+    (24668, 0):    "Ось РУ1Ш-957",
+    (24669, None): "Ось колёсной пары грузового вагона",
+    (24670, None): "Ось локомотива ТЭП70",
+    (24671, None): "Ось ВЛ80",
+    (24672, None): "Ось ЭП1М",
+    (24750, None): "Колёсная пара (РУ1)",
+    (24751, None): "Колёсная пара (РУ1Ш)",
+    (24752, None): "Колёсная пара тепловоза",
+    (24753, None): "Колёсная пара электровоза",
+    (24800, None): "Бандаж локомотива",
+    (24801, None): "Бандаж пассажирского вагона",
+    (24802, None): "Бандаж грузового вагона",
+    (24803, None): "Обод колесной пары",
+    (24850, None): "Гребень колёсной пары",
+    (24851, None): "Гребень бандажа",
+    (24900, None): "Шейка оси (зеркальный канал)",
+    (24901, None): "Подступичная часть",
+    (24902, None): "Средняя часть оси",
+    # Базовая (Version1)
+    (10001, None): "Толщиномер",
+    (10002, None): "Стенка трубы",
+    (10003, None): "Лист металла",
+    (10004, None): "Сварной шов",
+    # Рельсовая (Version3)
+    (40001, None): "Рельс Р50",
+    (40002, None): "Рельс Р65",
+    (40003, None): "Рельс Р75",
+    (40004, None): "Рельс Р43",
+    (40010, None): "Стрелочный перевод",
+    (40020, None): "Сварной стык рельса",
+    (40030, None): "Болтовое отверстие в рельсе",
+    (40040, None): "Подошва рельса",
+    (40050, None): "Шейка рельса",
+    (40060, None): "Головка рельса",
+    # Резерв
+    (0, None):     "\u2014",
+}
+
+
+def decode_type_name(tcode: int, sub_b: int) -> str:
+    """Имя типового варианта по словарю TYPEVAR_DICT.
+
+    Стратегия поиска:
+      1. Точное совпадение (tcode, sub_b);
+      2. Совпадение (tcode, None) -- для tcode без sub-варианта;
+      3. fallback -- 'Ось колесной пары'.
+    """
+    name = TYPEVAR_DICT.get((tcode, sub_b))
+    if name:
+        return name
+    name = TYPEVAR_DICT.get((tcode, None))
+    if name:
+        return name
+    return "Ось колесной пары"
+
+
+@dataclass
+class MeasurementRecord:
+    """Декодированная запись УД2-102 (BCD-паспорт оси/колесной пары)."""
+    addr:       int
+    raw:        bytes
+    anchor:     int
+    date_str:   str
+    num_obj:    str
+    plavka:     str
+    stamp:      int
+    god:        int
+    type_name:  str
+    tcode:      int
+    sub_b:      int
+    side:       str
+    sheika:     str
+    obod:       str
+    obtochka:   str
+    greben:     str
+    naplavka:   str
+
+    def summary(self) -> str:
+        _dash = "\u2014"
+        return (f"[УД2-102] addr=0x{self.addr:04x} {self.date_str} "
+                f"{self.type_name} #{self.num_obj or _dash} "
+                f"плавка={self.plavka or _dash} {self.side} {self.sheika}")
+
+
+def _is_all_zero_or_0a(buf: bytes) -> bool:
+    """Проверяет, что буфер состоит только из нулей и/или 0x0A (терминатор)."""
+    return all(b == 0 or b == 0x0A for b in buf)
+
+
+def parse_ud2102_record(addr: int, raw84: bytes) -> Optional[MeasurementRecord]:
+    """Парсит 84-байтное тело записи УД2-102 с multi-candidate BCD offsets.
+
+    Если не нашли валидный плавающий якорь даты -- возвращает None.
+    Реализует двухкандидатный подход:
+      - Primary offsets (из документации): i+10..18 plavka, i+20..28 num_obj
+      - Alternative offsets (shift +2): i+12..20 plavka, i+22..30 num_obj
+    Если primary дает all-zero/0x0A для обоих полей -- пробуем alternative.
+    """
+    if len(raw84) < UD2_RECORD_BYTES:
+        return None
+
+    # Поиск плавающего якоря даты
+    anchor = -1
+    for i in range(min(15, UD2_RECORD_BYTES - 5)):
+        if is_valid_date_anchor(raw84, i):
+            anchor = i
+            break
+    if anchor < 0:
+        return None
+
+    i = anchor
+    d, m, y, h, mn = raw84[i], raw84[i + 1], raw84[i + 2], raw84[i + 3], raw84[i + 4]
+    date_str = f"{2000 + y:04d}-{m:02d}-{d:02d} {h:02d}:{mn:02d}"
+
+    def _slice(start: int, length: int) -> bytes:
+        s = i + start
+        e = min(len(raw84), s + length)
+        return bytes(raw84[s:e])
+
+    def _u16(start: int) -> int:
+        s = i + start
+        b0 = raw84[s] if s < len(raw84) else 0
+        b1 = raw84[s + 1] if s + 1 < len(raw84) else 0
+        return b0 | (b1 << 8)
+
+    def _u8(start: int) -> int:
+        s = i + start
+        return raw84[s] if 0 <= s < len(raw84) else 0
+
+    # Primary offsets (из PELENG_REVERSE.md)
+    tcode = _u16(5)
+    sub_b = _u8(7)
+    plavka_raw = _slice(10, 9)
+    num_obj_raw = _slice(20, 9)
+    side_b = _u8(30)
+    sheika_b = _u8(31)
+    obod_val = _u16(32)
+    obtochka_val = _u8(34)
+    greben_val = _u16(35)
+    naplavka_b = _u8(37)
+
+    plavka = reverse_bcd(plavka_raw)
+    num_obj = reverse_bcd(num_obj_raw)
+
+    # Если primary offsets дают all-zero/0x0A для обоих полей, пробуем alternative (+2)
+    if _is_all_zero_or_0a(plavka_raw) and _is_all_zero_or_0a(num_obj_raw):
+        alt_plavka_raw = _slice(12, 9)
+        alt_num_obj_raw = _slice(22, 9)
+        alt_plavka = reverse_bcd(alt_plavka_raw)
+        alt_num_obj = reverse_bcd(alt_num_obj_raw)
+        alt_side_b = _u8(32)
+        alt_sheika_b = _u8(33)
+
+        # Validate alternative candidate
+        if ((alt_plavka or alt_num_obj) and
+                alt_side_b in (0, 1) and alt_sheika_b in (0, 1, 2)):
+            plavka = alt_plavka
+            num_obj = alt_num_obj
+            side_b = alt_side_b
+            sheika_b = alt_sheika_b
+            obod_val = _u16(34)
+            obtochka_val = _u8(36)
+            greben_val = _u16(37)
+            naplavka_b = _u8(39)
+
+    # Validation: side_b should be 0 or 1, sheika_b should be 0, 1, or 2
+    # If neither candidate produces valid data, still return what we have
+    # (the date anchor was valid, so the record is not completely broken)
+
+    return MeasurementRecord(
+        addr=addr, raw=bytes(raw84), anchor=anchor,
+        date_str=date_str,
+        num_obj=num_obj, plavka=plavka,
+        stamp=0, god=0,
+        type_name=decode_type_name(tcode, sub_b), tcode=tcode, sub_b=sub_b,
+        side=decode_side(side_b),
+        sheika=decode_sheika(sheika_b),
+        obod=str(obod_val),
+        obtochka=str(obtochka_val),
+        greben=str(greben_val),
+        naplavka=decode_naplavka(naplavka_b),
+    )
+
+
+def _try_parse_ud2_bcd(blob: bytes) -> Optional[MeasurementRecord]:
+    """Пытается найти валидную BCD-запись УД2-102 внутри произвольного BLOB-а.
+
+    Сканирует все смещения 0..min(64, len-UD2_RECORD_BYTES) и возвращает
+    первый valid-result. Используется для дешифровки PROTOCOL-блобов
+    из SHORTPROT2 и тел BLOCKZAP.Block.
+    """
+    if not blob or len(blob) < UD2_RECORD_BYTES:
+        return None
+    max_off = min(len(blob) - UD2_RECORD_BYTES, 64)
+    for off in range(max_off + 1):
+        rec = parse_ud2102_record(addr=0, raw84=blob[off:off + UD2_RECORD_BYTES])
+        if rec is None:
+            continue
+        # Санитарная проверка: нормальный паспорт имеет плавку/номер или валидную сторону
+        if rec.plavka or rec.num_obj or rec.side in ("Левая", "Правая"):
+            return rec
+    return None
+
+
+def _try_extract_ud2_bcd_from_tlv(blockzap_block: bytes) -> Optional[MeasurementRecord]:
+    """Пробует найти BCD-запись УД2-102 внутри тела BLOCKZAP.Block.
+
+    Сначала идет по TLV-записям и пробует каждое тело распарсить как BCD.
+    Если ни одна TLV не подходит -- пробует весь блок как есть.
+    """
+    if not blockzap_block:
+        return None
+    # 1) Попробовать TLV
+    body = blockzap_block[16:] if len(blockzap_block) > 16 else blockzap_block
+    try:
+        tlvs = TLVRecord.parse_all(body)
+    except Exception:
+        tlvs = []
+    for t in tlvs:
+        rec = _try_parse_ud2_bcd(t.body)
+        if rec is not None:
+            return rec
+    # 2) Fallback -- bytes-сканер по всему блоку
+    return _try_parse_ud2_bcd(blockzap_block)
 
 
 # ============= 3. DECODERS AND DATA STRUCTURES =============
@@ -2736,50 +3067,74 @@ def _create_gui_classes():
             self._start_addr = start_addr
             self._end_addr = end_addr
             self._abort_event = threading.Event()
-            self._max_streak = 100
 
         def abort(self) -> None:
             """Установка флага прерывания сканирования (потокобезопасно)."""
             self._abort_event.set()
 
         def run(self) -> None:
-            """Основной цикл сканирования (выполняется в фоновом потоке)."""
+            """Основной цикл сканирования с base+streak алгоритмом."""
             try:
                 count = 0
-                streak = 0
-                addr = self._start_addr
-                while addr <= self._end_addr:
-                    # Проверяем флаг отмены
+                bases = UD2_BASES
+                indices_per_base = UD2_INDICES_PER_BASE
+                total_addrs = len(bases) * indices_per_base
+                processed = 0
+
+                for base in bases:
                     if self._abort_event.is_set():
                         break
-
-                    lo = addr & 0xFF
-                    hi = (addr >> 8) & 0xFF
-                    rec = self._ud2.read_record(lo, hi)
-
-                    if rec is None:
-                        streak += 1
-                        if streak >= self._max_streak:
+                    seen_hit = False
+                    empty_streak = 0
+                    for idx in range(indices_per_base):
+                        if self._abort_event.is_set():
                             break
-                    else:
-                        streak = 0
-                        count += 1
-                        # Декодируем для отображения в таблице
-                        decoded_info = self._make_decoded_info(rec)
-                        self.record_found.emit(rec, decoded_info)
+                        addr = base + idx
+                        rec = self._ud2.read_record(addr)
+                        processed += 1
 
-                    addr += 1
-                    # Отправляем прогресс каждые 16 адресов для снижения нагрузки
-                    if addr % 16 == 0:
-                        self.progress.emit(addr, self._end_addr)
+                        if rec is None:
+                            empty_streak += 1
+                            limit = UD2_STREAK_AFTER_HIT if seen_hit else UD2_STREAK_NO_HITS
+                            if empty_streak >= limit:
+                                break
+                        else:
+                            empty_streak = 0
+                            seen_hit = True
+                            count += 1
+                            decoded_info = self._make_decoded_info(rec, addr)
+                            self.record_found.emit(rec, decoded_info)
+
+                        # Отправляем прогресс каждые 8 адресов
+                        if processed % 8 == 0:
+                            self.progress.emit(processed, total_addrs)
 
                 self.finished.emit(count)
             except Exception as e:
                 self.error.emit(str(e))
 
-        def _make_decoded_info(self, raw: bytes) -> str:
-            """Формирование строки с информацией о записи для отображения."""
+        def _make_decoded_info(self, raw: bytes, addr: int = 0) -> str:
+            """Формирование строки с информацией о записи для отображения.
+
+            Пробует распарсить как BCD-запись УД2-102. Если удается --
+            возвращает расшифрованные поля. Иначе пробует TLV-декодирование.
+            """
             try:
+                # Пробуем BCD-парсинг (2 байта header + 84 байта body)
+                if len(raw) >= UD2_RECORD_HEADER_BYTES + UD2_RECORD_BYTES:
+                    body84 = raw[UD2_RECORD_HEADER_BYTES:UD2_RECORD_HEADER_BYTES + UD2_RECORD_BYTES]
+                    mr = parse_ud2102_record(addr, body84)
+                    if mr is not None:
+                        parts = []
+                        parts.append(mr.type_name)
+                        parts.append(mr.date_str)
+                        if mr.num_obj:
+                            parts.append(f"#{mr.num_obj}")
+                        if mr.plavka:
+                            parts.append(f"пл.{mr.plavka}")
+                        parts.append(mr.side)
+                        return "|".join(parts)
+                # Fallback: TLV-декодирование
                 tlv = TLVRecord.parse(raw)
                 if tlv is None:
                     return ""
@@ -3043,6 +3398,19 @@ def _handle_protocol_double_click(window, row: int) -> None:
     row_data = item.data(Qt.ItemDataRole.UserRole)
     if not row_data:
         return
+
+    # Проверяем, есть ли UD2 measurement поля в row_data
+    if row_data.get("num_obj") or row_data.get("plavka") or row_data.get("type_name"):
+        # UD2 measurement record -- показываем расшифровку BCD полей
+        DecryptionDialogCls, _, _ = _create_dialog_classes()
+        if DecryptionDialogCls:
+            rec = DecodedRecord()
+            rec.fields = dict(row_data)
+            rec.category_name = row_data.get("type_name", "УД2-102")
+            dlg = DecryptionDialogCls(window, rec)
+            dlg.exec()
+        return
+
     # Пробуем получить BLOB из BlockZap
     rec_id = row_data.get("id") or row_data.get("_blockzap_id")
     blob = None
@@ -3052,6 +3420,28 @@ def _handle_protocol_double_click(window, row: int) -> None:
         except (ValueError, TypeError):
             pass
     if blob:
+        # Пробуем BCD-парсинг из BLOB
+        mr = _try_extract_ud2_bcd_from_tlv(blob)
+        if mr is not None:
+            DecryptionDialogCls, _, _ = _create_dialog_classes()
+            if DecryptionDialogCls:
+                rec = DecodedRecord()
+                rec.fields = {
+                    "type_name": mr.type_name,
+                    "date_str": mr.date_str,
+                    "num_obj": mr.num_obj,
+                    "plavka": mr.plavka,
+                    "side": mr.side,
+                    "sheika": mr.sheika,
+                    "obod": mr.obod,
+                    "obtochka": mr.obtochka,
+                    "greben": mr.greben,
+                    "naplavka": mr.naplavka,
+                }
+                rec.category_name = mr.type_name
+                dlg = DecryptionDialogCls(window, rec)
+                dlg.exec()
+            return
         tlv = TLVRecord.parse(blob)
         if tlv:
             decoded = dispatch_decode(tlv)
@@ -3082,6 +3472,18 @@ def _handle_report_double_click(window, row: int) -> None:
     row_data = item.data(Qt.ItemDataRole.UserRole)
     if not row_data:
         return
+
+    # Проверяем, есть ли UD2 measurement поля в row_data
+    if row_data.get("num_obj") or row_data.get("plavka") or row_data.get("type_name"):
+        DecryptionDialogCls, _, _ = _create_dialog_classes()
+        if DecryptionDialogCls:
+            rec = DecodedRecord()
+            rec.fields = dict(row_data)
+            rec.category_name = row_data.get("type_name", "УД2-102")
+            dlg = DecryptionDialogCls(window, rec)
+            dlg.exec()
+        return
+
     rec_id = row_data.get("id") or row_data.get("_blockzap_id")
     blob = None
     if rec_id:
@@ -3090,6 +3492,28 @@ def _handle_report_double_click(window, row: int) -> None:
         except (ValueError, TypeError):
             pass
     if blob:
+        # Пробуем BCD-парсинг из BLOB
+        mr = _try_extract_ud2_bcd_from_tlv(blob)
+        if mr is not None:
+            DecryptionDialogCls, _, _ = _create_dialog_classes()
+            if DecryptionDialogCls:
+                rec = DecodedRecord()
+                rec.fields = {
+                    "type_name": mr.type_name,
+                    "date_str": mr.date_str,
+                    "num_obj": mr.num_obj,
+                    "plavka": mr.plavka,
+                    "side": mr.side,
+                    "sheika": mr.sheika,
+                    "obod": mr.obod,
+                    "obtochka": mr.obtochka,
+                    "greben": mr.greben,
+                    "naplavka": mr.naplavka,
+                }
+                rec.category_name = mr.type_name
+                dlg = DecryptionDialogCls(window, rec)
+                dlg.exec()
+            return
         tlv = TLVRecord.parse(blob)
         if tlv:
             decoded = dispatch_decode(tlv)
