@@ -324,23 +324,36 @@ class PelengPort:
         return None
 
     def handshake_full(self) -> Optional[bytes]:
-        """Отправляет 0x55 и читает ВСЕ доступные данные (до HANDSHAKE_FULL_BUFFER байт).
+        """Отправляет 0x55 и читает ВСЕ доступные данные (каталог адресов).
 
         Используется при полном приёме данных с прибора (F5).
         Ответ = 16 байт header + каталог (массив LE16 адресов).
+        Вместо блокирующего чтения 524304 байт (ждёт timeout) читаем порциями.
         """
         with self._lock:
             if not self.is_open:
                 if not self.open():
                     return None
+            # Очищаем буфер перед отправкой
+            self._serial.reset_input_buffer()
             self._send_byte(OP_HANDSHAKE)
-            # Читаем максимальный объём данных с таймаутом порта
-            reply = self._serial.read(HANDSHAKE_FULL_BUFFER)
+            # Читаем данные порциями с коротким таймаутом
+            # Прибор отвечает быстро, но объём ответа неизвестен заранее
+            old_timeout = self._serial.timeout
+            self._serial.timeout = 0.5  # 500ms на первый ответ
+            chunks = []
+            while True:
+                chunk = self._serial.read(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                self._serial.timeout = 0.1  # 100ms на последующие порции
+            self._serial.timeout = old_timeout
+            reply = b''.join(chunks)
             if reply and len(reply) >= HANDSHAKE_REPLY_LEN:
                 LOG.info("Полный хэндшейк: получено %d байт", len(reply))
                 return reply
-            LOG.warning("Полный хэндшейк: получено %d байт (мин. %d)",
-                        len(reply) if reply else 0, HANDSHAKE_REPLY_LEN)
+            LOG.warning("Полный хэндшейк: получено %d байт", len(reply) if reply else 0)
             return None
 
     def read_block_by_addr(self, addr: int) -> Optional[bytes]:
@@ -354,21 +367,27 @@ class PelengPort:
                 return None
             addr_lo = addr & 0xFF
             addr_hi = (addr >> 8) & 0xFF
-            self._send_byte(OP_BLOCK_READ)
-            self._send_byte(addr_lo)
-            self._send_byte(addr_hi)
-            # Сначала читаем TLV header (4 байта: tag LE16 + length LE16)
-            hdr = self._read_bytes(TLV_HEADER_SIZE)
-            if len(hdr) < TLV_HEADER_SIZE:
-                return None
-            tag = struct.unpack_from('<H', hdr, 0)[0]
-            length = struct.unpack_from('<H', hdr, 2)[0]
-            if tag == TLV_PADDING_TAG or length == 0:
-                return None
-            body = self._read_bytes(length)
-            if len(body) < length:
-                LOG.warning("Блок 0x%04X: получено %d/%d байт тела", addr, len(body), length)
-            return hdr + body
+            # Уменьшаем таймаут для быстрого сканирования
+            old_timeout = self._serial.timeout
+            self._serial.timeout = 0.3  # 300ms достаточно для одного блока
+            try:
+                self._send_byte(OP_BLOCK_READ)
+                self._send_byte(addr_lo)
+                self._send_byte(addr_hi)
+                # Сначала читаем TLV header (4 байта: tag LE16 + length LE16)
+                hdr = self._read_bytes(TLV_HEADER_SIZE)
+                if len(hdr) < TLV_HEADER_SIZE:
+                    return None
+                tag = struct.unpack_from('<H', hdr, 0)[0]
+                length = struct.unpack_from('<H', hdr, 2)[0]
+                if tag == TLV_PADDING_TAG or length == 0:
+                    return None
+                body = self._read_bytes(length)
+                if len(body) < length:
+                    LOG.warning("Блок 0x%04X: получено %d/%d байт", addr, len(body), length)
+                return hdr + body
+            finally:
+                self._serial.timeout = old_timeout
 
     def request_block(self, block_len: int) -> Optional[bytes]:
         """Запрашивает блок данных: отправляет 0x42 + LL + HH, читает block_len байт."""
@@ -1231,29 +1250,93 @@ class BlockZapDB:
         return self.filter_by_category(["CALIBRATION"])
 
     def import_fdb(self, fdb_path: str) -> int:
-        """Импорт записей из файла FDB/DAT (16-байт header + RAW flash dump)."""
+        """Импорт записей из файла FDB (Firebird 2.x база данных PelengPC).
+
+        PelengPC хранит данные в Firebird Embedded DB (gds32.dll).
+        Файл .fdb -- это база Firebird 2.x (ODS 11.0).
+        Если пакет fdb недоступен, пробуем как бинарный flash dump.
+        """
         if not os.path.isfile(fdb_path):
             LOG.error("Файл не найден: %s", fdb_path)
             return 0
+
+        # Попытка 1: Firebird database через пакет fdb
+        try:
+            import fdb as _fdb
+            # Поиск клиентской библиотеки Firebird
+            fb_lib = None
+            for candidate in [
+                os.environ.get('PELENG_FBCLIENT', ''),
+                str(Path.home() / '.peleng_clone' / 'fb25' / 'fbembed.dll'),
+                'fbembed.dll', 'fbclient.dll',
+                '/usr/lib/libfbembed.so.2.5',
+                '/usr/lib/x86_64-linux-gnu/libfbclient.so',
+            ]:
+                if candidate and os.path.isfile(candidate):
+                    fb_lib = candidate
+                    break
+            if fb_lib and getattr(_fdb, 'api', None) is None:
+                _fdb.load_api(fb_lib)
+
+            conn = _fdb.connect(
+                dsn=fdb_path,
+                user='SYSDBA',
+                password='masterkey',
+                charset='WIN1251'
+            )
+            count = 0
+            # Читаем таблицу BLOCKZAP (основное хранилище блоков)
+            cursor = conn.cursor()
+            # Пробуем несколько вариантов имён таблиц (вагонная/рельсовая/ОТД)
+            for suffix in ('1', '2', '3', ''):
+                table_name = f'BLOCKZAP{suffix}' if suffix else 'BLOCKZAP'
+                try:
+                    cursor.execute(f'SELECT BLOCK_BLOB FROM {table_name}')
+                    for row in cursor:
+                        blob_data = row[0]
+                        if blob_data and len(blob_data) > TLV_HEADER_SIZE:
+                            if isinstance(blob_data, str):
+                                blob_data = blob_data.encode('latin-1')
+                            tlv = TLVRecord.parse(bytes(blob_data))
+                            if tlv:
+                                decoded = dispatch_decode(tlv)
+                                self.upsert(decoded, tlv.raw)
+                                count += 1
+                except Exception as e:
+                    LOG.debug("Таблица %s: %s", table_name, e)
+                    continue
+            conn.close()
+            LOG.info("FDB импорт: %d записей из %s", count, fdb_path)
+            return count
+
+        except ImportError:
+            LOG.warning("Пакет fdb не установлен, пробую бинарный формат")
+        except Exception as e:
+            LOG.warning("FDB подключение не удалось (%s), пробую бинарный формат", e)
+
+        # Попытка 2: бинарный flash dump (16-байт header + raw flash)
         with open(fdb_path, 'rb') as f:
             data = f.read()
         if len(data) < 17:
-            LOG.error("FDB файл слишком мал: %d байт (мин. 17)", len(data))
+            LOG.error("Файл слишком мал: %d байт", len(data))
             return 0
-        # Проверка "пустого" файла: LE16 по смещению 0x10 == 0xFFFF
-        if len(data) > 0x11 and struct.unpack_from('<H', data, 0x10)[0] == 0xFFFF:
-            LOG.warning("FDB файл пустой (0xFFFF по смещению 0x10)")
-            return 0
-        # Пропускаем 16-байтный handshake header
-        flash_data = data[16:]
-        # Парсим TLV-записи из flash dump
-        tlv_records = TLVRecord.parse_all(flash_data)
+
         count = 0
-        for tlv in tlv_records:
-            decoded = dispatch_decode(tlv)
-            self.upsert(decoded, tlv.raw)
-            count += 1
-        LOG.info("Импортировано %d записей из %s", count, fdb_path)
+        # Пробуем парсить как TLV с разных смещений
+        for skip in (0, 16):
+            flash_data = data[skip:]
+            tlv_records = TLVRecord.parse_all(flash_data)
+            if tlv_records:
+                for tlv in tlv_records:
+                    decoded = dispatch_decode(tlv)
+                    self.upsert(decoded, tlv.raw)
+                    count += 1
+                break
+
+        if count == 0:
+            LOG.warning("Не удалось распознать формат файла %s", fdb_path)
+        else:
+            LOG.info("Бинарный импорт: %d записей из %s", count, fdb_path)
         return count
 
     def export_to_path(self, out_path: str) -> bool:
@@ -1867,13 +1950,27 @@ def _create_gui_classes():
                 self._refresh_tables()
 
         def _action_import_fdb(self) -> None:
-            """Действие: Импорт из FDB файла."""
+            """Действие: Импорт из FDB файла (Firebird БД или бинарный дамп)."""
             path, _ = QFileDialog.getOpenFileName(self, "\u0418\u043c\u043f\u043e\u0440\u0442 FDB",
-                                                   "", "Flash dump (*.fdb *.dat *.bin);;All (*)")
+                                                   str(Path.home()),
+                                                   "Firebird DB (*.fdb *.FDB);;Flash dump (*.dat *.bin);;All (*)")
             if path and self._db:
+                self._statusbar.showMessage("\u0418\u043c\u043f\u043e\u0440\u0442...")
+                QApplication.processEvents()
                 count = self._db.import_fdb(path)
                 self._refresh_tables()
-                self._statusbar.showMessage(f"\u0418\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u043e {count} \u0437\u0430\u043f\u0438\u0441\u0435\u0439")
+                if count > 0:
+                    self._statusbar.showMessage(f"\u0418\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u043e {count} \u0437\u0430\u043f\u0438\u0441\u0435\u0439 \u0438\u0437 {Path(path).name}")
+                    QMessageBox.information(self, "\u0418\u043c\u043f\u043e\u0440\u0442 FDB",
+                        f"\u0423\u0441\u043f\u0435\u0448\u043d\u043e \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u043e {count} \u0437\u0430\u043f\u0438\u0441\u0435\u0439")
+                else:
+                    self._statusbar.showMessage("\u0418\u043c\u043f\u043e\u0440\u0442: \u0437\u0430\u043f\u0438\u0441\u0438 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u044b")
+                    QMessageBox.warning(self, "\u0418\u043c\u043f\u043e\u0440\u0442 FDB",
+                        "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0437\u0430\u043f\u0438\u0441\u0438.\n\n"
+                        "\u0412\u043e\u0437\u043c\u043e\u0436\u043d\u044b\u0435 \u043f\u0440\u0438\u0447\u0438\u043d\u044b:\n"
+                        "\u2022 \u0414\u043b\u044f .fdb \u043d\u0443\u0436\u0435\u043d \u043f\u0430\u043a\u0435\u0442: pip install fdb\n"
+                        "\u2022 \u041d\u0443\u0436\u043d\u0430 \u0431\u0438\u0431\u043b\u0438\u043e\u0442\u0435\u043a\u0430 Firebird 2.5 (fbembed.dll)\n"
+                        "\u2022 \u0424\u0430\u0439\u043b \u043f\u0443\u0441\u0442 \u0438\u043b\u0438 \u043f\u043e\u0432\u0440\u0435\u0436\u0434\u0451\u043d")
 
         def _action_export_excel(self) -> None:
             """Действие: Экспорт в Excel."""
