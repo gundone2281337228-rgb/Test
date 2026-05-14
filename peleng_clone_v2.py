@@ -121,10 +121,16 @@ DEFAULT_VELOCITY_MPS: int = 5900  # Скорость УЗ в стали, м/с
 
 # Категории по sweep_addr / 1000
 CATEGORY_DISPATCH: Dict[int, Tuple[str, int]] = {
+    0:  ("GENERIC", 1),      # decoder_type=1 (неизвестный тип, но не UNKNOWN)
     1:  ("A_SCAN", 2),       # decoder_type=2
+    2:  ("A_SCAN", 2),       # decoder_type=2 (дополнительный A-scan)
+    3:  ("SETTINGS", 1),     # decoder_type=1 (настройки прибора)
     4:  ("GENERIC", 1),      # decoder_type=1
     5:  ("CALIBRATION", 1),  # decoder_type=1 (настройки)
     6:  ("GENERIC", 1),      # decoder_type=1
+    7:  ("GENERIC", 1),      # decoder_type=1
+    8:  ("GENERIC", 1),      # decoder_type=1
+    9:  ("GENERIC", 1),      # decoder_type=1
     10: ("B_SCAN", 3),       # decoder_type=3
     11: ("B_SCAN", 3),
     12: ("B_SCAN", 3),
@@ -1128,6 +1134,16 @@ def _date_iso(v) -> Optional[str]:
     return s
 
 
+def _fmt_date_display(iso_str: str) -> str:
+    """Конвертирует YYYY-MM-DD в DD.MM.YYYY для отображения в таблицах."""
+    if not iso_str or len(iso_str) < 10:
+        return iso_str
+    parts = iso_str[:10].split("-")
+    if len(parts) == 3 and len(parts[0]) == 4:
+        return f"{parts[2]}.{parts[1]}.{parts[0]}"
+    return iso_str
+
+
 def _fdb_make_year(maketime) -> int:
     """Extract year from MAKETIME integer (YYYYMM or YYYY format)."""
     if not maketime:
@@ -1951,27 +1967,7 @@ def _create_gui_classes():
             """Инициализация вкладки Протоколы с таблицей записей A-scan и B-scan."""
             layout = QVBoxLayout(self._tab_protocols)
             self._tbl_protocols = QTableWidget()
-            self._tbl_protocols.setColumnCount(8)
-            self._tbl_protocols.setHorizontalHeaderLabels([
-                "\u0410\u0434\u0440\u0435\u0441", "\u0414\u0430\u0442\u0430",
-                "\u0412\u0440\u0435\u043c\u044f", "\u0422\u0438\u043f",
-                "\u2116 \u043e\u0431\u044a\u0435\u043a\u0442\u0430",
-                "\u041f\u043b\u0430\u0432\u043a\u0430",
-                "\u0414\u0435\u0444\u0435\u043a\u0442",
-                "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440"
-            ])
-            self._tbl_protocols.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-            self._tbl_protocols.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-            self._tbl_protocols.horizontalHeader().setStretchLastSection(True)
-            self._tbl_protocols.doubleClicked.connect(self._on_protocol_double_click)
-            layout.addWidget(self._tbl_protocols)
-
-        def _init_tab_reports(self) -> None:
-            """Инициализация вкладки Отчеты с таблицей отчетных записей."""
-            layout = QVBoxLayout(self._tab_reports)
-            self._tbl_reports = QTableWidget()
-            self._tbl_reports.setColumnCount(17)
-            self._tbl_reports.setHorizontalHeaderLabels([
+            _vagon_cols = [
                 "\u0410\u0434\u0440\u0435\u0441", "\u0414\u0430\u0442\u0430",
                 "\u0412\u0440\u0435\u043c\u044f", "\u0422\u0438\u043f",
                 "\u2116 \u043e\u0431\u044a\u0435\u043a\u0442\u0430",
@@ -1984,10 +1980,47 @@ def _create_gui_classes():
                 "\u041e\u0431\u0442\u043e\u0447\u043a\u0430",
                 "\u0413\u0440\u0435\u0431\u0435\u043d\u044c",
                 "\u041d\u0430\u043f\u043b\u0430\u0432\u043a\u0430",
+                "\u0417\u0430\u0432\u043e\u0434 (\u0438\u043d\u0434.)",
+                "\u0414\u0430\u0442\u0430 \u0438\u0437\u0433.",
                 "\u0414\u0435\u0444\u0435\u043a\u0442",
                 "\u041a\u043e\u0434 \u0434\u0435\u0444.",
-                "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440"
-            ])
+                "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440",
+                "\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a",
+            ]
+            self._tbl_protocols.setColumnCount(len(_vagon_cols))
+            self._tbl_protocols.setHorizontalHeaderLabels(_vagon_cols)
+            self._tbl_protocols.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self._tbl_protocols.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self._tbl_protocols.horizontalHeader().setStretchLastSection(True)
+            self._tbl_protocols.doubleClicked.connect(self._on_protocol_double_click)
+            layout.addWidget(self._tbl_protocols)
+
+        def _init_tab_reports(self) -> None:
+            """Инициализация вкладки Отчеты с таблицей отчетных записей."""
+            layout = QVBoxLayout(self._tab_reports)
+            self._tbl_reports = QTableWidget()
+            _vagon_cols = [
+                "\u0410\u0434\u0440\u0435\u0441", "\u0414\u0430\u0442\u0430",
+                "\u0412\u0440\u0435\u043c\u044f", "\u0422\u0438\u043f",
+                "\u2116 \u043e\u0431\u044a\u0435\u043a\u0442\u0430",
+                "\u041f\u043b\u0430\u0432\u043a\u0430",
+                "\u041a\u043b\u0435\u0439\u043c\u043e",
+                "\u0413\u043e\u0434",
+                "\u0421\u0442\u043e\u0440\u043e\u043d\u0430",
+                "\u0428\u0435\u0439\u043a\u0430",
+                "\u041e\u0431\u043e\u0434",
+                "\u041e\u0431\u0442\u043e\u0447\u043a\u0430",
+                "\u0413\u0440\u0435\u0431\u0435\u043d\u044c",
+                "\u041d\u0430\u043f\u043b\u0430\u0432\u043a\u0430",
+                "\u0417\u0430\u0432\u043e\u0434 (\u0438\u043d\u0434.)",
+                "\u0414\u0430\u0442\u0430 \u0438\u0437\u0433.",
+                "\u0414\u0435\u0444\u0435\u043a\u0442",
+                "\u041a\u043e\u0434 \u0434\u0435\u0444.",
+                "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440",
+                "\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a",
+            ]
+            self._tbl_reports.setColumnCount(len(_vagon_cols))
+            self._tbl_reports.setHorizontalHeaderLabels(_vagon_cols)
             self._tbl_reports.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self._tbl_reports.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             self._tbl_reports.horizontalHeader().setStretchLastSection(True)
@@ -1998,17 +2031,28 @@ def _create_gui_classes():
             """Инициализация вкладки Настройки с таблицей параметров прибора."""
             layout = QVBoxLayout(self._tab_settings)
             self._tbl_settings = QTableWidget()
-            self._tbl_settings.setColumnCount(9)
-            self._tbl_settings.setHorizontalHeaderLabels([
+            _vagon_cols = [
                 "\u0410\u0434\u0440\u0435\u0441", "\u0414\u0430\u0442\u0430",
-                "\u0422\u0438\u043f",
-                "\u0423\u0441\u0438\u043b\u0435\u043d\u0438\u0435",
-                "\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c",
-                "\u0423\u0433\u043e\u043b",
-                "\u0421\u0442\u0440\u043e\u0431 \u043d\u0430\u0447.",
-                "\u0421\u0442\u0440\u043e\u0431 \u0448\u0438\u0440.",
-                "\u041f\u043e\u0440\u043e\u0433"
-            ])
+                "\u0412\u0440\u0435\u043c\u044f", "\u0422\u0438\u043f",
+                "\u2116 \u043e\u0431\u044a\u0435\u043a\u0442\u0430",
+                "\u041f\u043b\u0430\u0432\u043a\u0430",
+                "\u041a\u043b\u0435\u0439\u043c\u043e",
+                "\u0413\u043e\u0434",
+                "\u0421\u0442\u043e\u0440\u043e\u043d\u0430",
+                "\u0428\u0435\u0439\u043a\u0430",
+                "\u041e\u0431\u043e\u0434",
+                "\u041e\u0431\u0442\u043e\u0447\u043a\u0430",
+                "\u0413\u0440\u0435\u0431\u0435\u043d\u044c",
+                "\u041d\u0430\u043f\u043b\u0430\u0432\u043a\u0430",
+                "\u0417\u0430\u0432\u043e\u0434 (\u0438\u043d\u0434.)",
+                "\u0414\u0430\u0442\u0430 \u0438\u0437\u0433.",
+                "\u0414\u0435\u0444\u0435\u043a\u0442",
+                "\u041a\u043e\u0434 \u0434\u0435\u0444.",
+                "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440",
+                "\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a",
+            ]
+            self._tbl_settings.setColumnCount(len(_vagon_cols))
+            self._tbl_settings.setHorizontalHeaderLabels(_vagon_cols)
             self._tbl_settings.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self._tbl_settings.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             self._tbl_settings.horizontalHeader().setStretchLastSection(True)
@@ -2024,29 +2068,40 @@ def _create_gui_classes():
             self._refresh_settings_table()
 
         def _refresh_protocols_table(self) -> None:
-            """Обновляет таблицу протоколов из БД."""
+            """Обновляет таблицу протоколов из БД (все записи BlockZap + FDB-RESULTS)."""
             if not self._db:
                 return
             DASH = "\u2014"
             rows = []
-            # FDB records (protocols = RESULTS)
-            for m in self._db.all_measurements():
-                src = m.get("source", "")
-                if src == "FDB-RESULTS":
-                    rows.append(m)
-            # Also add A_SCAN/B_SCAN from BlockZap
-            for rec in self._db.filter_protocols():
+            # ВСЕ записи из BlockZap (от прибора через UART или TLV-парсинг)
+            for rec in self._db.all_records():
                 rows.append({
-                    "addr": rec.get("block_addr", rec.get("id", 0)),
+                    "addr": rec.get("block_addr", rec.get("sweep_addr", rec.get("id", 0))),
                     "date_str": rec.get("date_str", ""),
                     "time_str": rec.get("time_str", ""),
                     "type_name": rec.get("category", ""),
                     "num_obj": rec.get("passport_primary", ""),
                     "plavka": "",
-                    "defekt": "",
+                    "stamp": "",
+                    "god": "",
+                    "side": "",
+                    "sheika": "",
+                    "obod": "",
+                    "obtochka": "",
+                    "greben": "",
+                    "naplavka": "",
+                    "ind_maker": "",
+                    "make_time": "",
+                    "defekt": rec.get("verdict", ""),
+                    "code_def": "",
                     "operator": rec.get("passport_secondary", ""),
                     "source": "UART",
                 })
+            # Записи FDB-RESULTS из Measurements
+            for m in self._db.all_measurements():
+                src = m.get("source", "")
+                if src == "FDB-RESULTS":
+                    rows.append(m)
             self._tbl_protocols.setSortingEnabled(False)
             self._tbl_protocols.setRowCount(len(rows))
             for i, r in enumerate(rows):
@@ -2059,13 +2114,25 @@ def _create_gui_classes():
                     addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
                 cells = [
                     addr_str,
-                    r.get("date_str", "") or DASH,
+                    _fmt_date_display(r.get("date_str", "") or "") or DASH,
                     r.get("time_str", "") or DASH,
                     r.get("type_name", "") or DASH,
                     r.get("num_obj", "") or DASH,
                     r.get("plavka", "") or DASH,
+                    r.get("stamp", "") or DASH,
+                    r.get("god", "") if r.get("god", "") not in ("", "0") else DASH,
+                    r.get("side", "") or DASH,
+                    r.get("sheika", "") or DASH,
+                    r.get("obod", "") or DASH,
+                    r.get("obtochka", "") or DASH,
+                    r.get("greben", "") or DASH,
+                    r.get("naplavka", "") or DASH,
+                    r.get("ind_maker", "") or DASH,
+                    _fmt_date_display(r.get("make_time", "") or "") or DASH,
                     r.get("defekt", "") or DASH,
+                    r.get("code_def", "") or DASH,
                     r.get("operator", "") or DASH,
+                    r.get("source", "") or DASH,
                 ]
                 for j, cell in enumerate(cells):
                     item = QTableWidgetItem(str(cell))
@@ -2076,15 +2143,40 @@ def _create_gui_classes():
             self._tbl_protocols.resizeColumnsToContents()
 
         def _refresh_reports_table(self) -> None:
-            """Обновляет таблицу отчетов из БД."""
+            """Обновляет таблицу отчетов из БД (FDB-SHORTPROT/UD2 + BlockZap SHORT_PROTO/GENERIC/UNKNOWN)."""
             if not self._db:
                 return
             DASH = "\u2014"
             rows = []
+            # Записи FDB-SHORTPROT и UD2 из Measurements
             for m in self._db.all_measurements():
                 src = m.get("source", "")
                 if src in ("FDB-SHORTPROT", "UD2"):
                     rows.append(m)
+            # Записи SHORT_PROTO/GENERIC/UNKNOWN из BlockZap
+            for rec in self._db.filter_reports():
+                rows.append({
+                    "addr": rec.get("block_addr", rec.get("id", 0)),
+                    "date_str": rec.get("date_str", ""),
+                    "time_str": rec.get("time_str", ""),
+                    "type_name": rec.get("category", ""),
+                    "num_obj": rec.get("passport_primary", ""),
+                    "plavka": "",
+                    "stamp": "",
+                    "god": "",
+                    "side": "",
+                    "sheika": "",
+                    "obod": "",
+                    "obtochka": "",
+                    "greben": "",
+                    "naplavka": "",
+                    "ind_maker": "",
+                    "make_time": "",
+                    "defekt": rec.get("verdict", ""),
+                    "code_def": "",
+                    "operator": rec.get("passport_secondary", ""),
+                    "source": "UART",
+                })
             self._tbl_reports.setSortingEnabled(False)
             self._tbl_reports.setRowCount(len(rows))
             for i, r in enumerate(rows):
@@ -2098,7 +2190,7 @@ def _create_gui_classes():
                     addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
                 cells = [
                     addr_str,
-                    r.get("date_str", "") or DASH,
+                    _fmt_date_display(r.get("date_str", "") or "") or DASH,
                     r.get("time_str", "") or DASH,
                     r.get("type_name", "") or DASH,
                     r.get("num_obj", "") or DASH,
@@ -2111,9 +2203,12 @@ def _create_gui_classes():
                     r.get("obtochka", "") or DASH,
                     r.get("greben", "") or DASH,
                     r.get("naplavka", "") or DASH,
+                    r.get("ind_maker", "") or DASH,
+                    _fmt_date_display(r.get("make_time", "") or "") or DASH,
                     r.get("defekt", "") or DASH,
                     r.get("code_def", "") or DASH,
                     r.get("operator", "") or DASH,
+                    r.get("source", "") or DASH,
                 ]
                 for j, cell in enumerate(cells):
                     item = QTableWidgetItem(str(cell))
@@ -2124,38 +2219,37 @@ def _create_gui_classes():
             self._tbl_reports.resizeColumnsToContents()
 
         def _refresh_settings_table(self) -> None:
-            """Обновляет таблицу настроек из БД."""
+            """Обновляет таблицу настроек из БД (FDB-NASTR + BlockZap CALIBRATION/SETTINGS)."""
             if not self._db:
                 return
             DASH = "\u2014"
             rows = []
-            # FDB settings
+            # Записи FDB-NASTR из Measurements
             for m in self._db.all_measurements():
                 if m.get("source") == "FDB-NASTR":
-                    rows.append({
-                        "addr": m.get("addr", 0),
-                        "date_str": m.get("date_str", ""),
-                        "type_name": m.get("type_name", ""),
-                        "gain_db": 0,
-                        "velocity_mps": 0,
-                        "angle_deg": 0,
-                        "gate_start": 0,
-                        "gate_width": 0,
-                        "threshold_pct": 0,
-                        "source": "FDB-NASTR",
-                    })
-            # BlockZap settings
+                    rows.append(m)
+            # Записи CALIBRATION/SETTINGS из BlockZap
             for rec in self._db.filter_settings():
                 rows.append({
                     "addr": rec.get("block_addr", rec.get("id", 0)),
                     "date_str": rec.get("date_str", ""),
+                    "time_str": rec.get("time_str", ""),
                     "type_name": rec.get("category", ""),
-                    "gain_db": rec.get("gain_db", 0),
-                    "velocity_mps": rec.get("velocity_mps", 0),
-                    "angle_deg": rec.get("angle_deg", 0),
-                    "gate_start": rec.get("gate_start", 0),
-                    "gate_width": rec.get("gate_width", 0),
-                    "threshold_pct": rec.get("threshold_pct", 0),
+                    "num_obj": rec.get("passport_primary", ""),
+                    "plavka": "",
+                    "stamp": "",
+                    "god": "",
+                    "side": "",
+                    "sheika": "",
+                    "obod": "",
+                    "obtochka": "",
+                    "greben": "",
+                    "naplavka": "",
+                    "ind_maker": "",
+                    "make_time": "",
+                    "defekt": rec.get("verdict", ""),
+                    "code_def": "",
+                    "operator": rec.get("passport_secondary", ""),
                     "source": "UART",
                 })
             self._tbl_settings.setSortingEnabled(False)
@@ -2170,14 +2264,25 @@ def _create_gui_classes():
                     addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
                 cells = [
                     addr_str,
-                    r.get("date_str", "") or DASH,
+                    _fmt_date_display(r.get("date_str", "") or "") or DASH,
+                    r.get("time_str", "") or DASH,
                     r.get("type_name", "") or DASH,
-                    str(r.get("gain_db", 0)),
-                    str(r.get("velocity_mps", 0)),
-                    str(r.get("angle_deg", 0)),
-                    str(r.get("gate_start", 0)),
-                    str(r.get("gate_width", 0)),
-                    str(r.get("threshold_pct", 0)),
+                    r.get("num_obj", "") or DASH,
+                    r.get("plavka", "") or DASH,
+                    r.get("stamp", "") or DASH,
+                    r.get("god", "") if r.get("god", "") not in ("", "0") else DASH,
+                    r.get("side", "") or DASH,
+                    r.get("sheika", "") or DASH,
+                    r.get("obod", "") or DASH,
+                    r.get("obtochka", "") or DASH,
+                    r.get("greben", "") or DASH,
+                    r.get("naplavka", "") or DASH,
+                    r.get("ind_maker", "") or DASH,
+                    _fmt_date_display(r.get("make_time", "") or "") or DASH,
+                    r.get("defekt", "") or DASH,
+                    r.get("code_def", "") or DASH,
+                    r.get("operator", "") or DASH,
+                    r.get("source", "") or DASH,
                 ]
                 for j, cell in enumerate(cells):
                     item = QTableWidgetItem(str(cell))
