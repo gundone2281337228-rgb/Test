@@ -102,6 +102,8 @@ OP_RTC_SYNC: int = 0x54        # Синхронизация часов
 
 # Длина ответа на хэндшейк
 HANDSHAKE_REPLY_LEN: int = 16
+# Максимальный размер ответа при полном приёме (header 16 + каталог до 512KB)
+HANDSHAKE_FULL_BUFFER: int = 0x80010  # 524304 байт
 # TLV: тег(LE16) + длина(LE16) + тело
 TLV_HEADER_SIZE: int = 4
 TLV_PADDING_TAG: int = 0xFFFF
@@ -218,7 +220,7 @@ LOG = logging.getLogger("peleng_clone_v2")
 @dataclass
 class PortConfig:
     """Конфигурация COM-порта для связи с прибором Пеленг."""
-    port_name: str = ""
+    port_name: str = "COM3"
     baud_rate: int = DEFAULT_BAUD
     data_bits: int = DATA_BITS
     parity: str = PARITY_EVEN
@@ -321,6 +323,53 @@ class PelengPort:
                 self.close()
         return None
 
+    def handshake_full(self) -> Optional[bytes]:
+        """Отправляет 0x55 и читает ВСЕ доступные данные (до HANDSHAKE_FULL_BUFFER байт).
+
+        Используется при полном приёме данных с прибора (F5).
+        Ответ = 16 байт header + каталог (массив LE16 адресов).
+        """
+        with self._lock:
+            if not self.is_open:
+                if not self.open():
+                    return None
+            self._send_byte(OP_HANDSHAKE)
+            # Читаем максимальный объём данных с таймаутом порта
+            reply = self._serial.read(HANDSHAKE_FULL_BUFFER)
+            if reply and len(reply) >= HANDSHAKE_REPLY_LEN:
+                LOG.info("Полный хэндшейк: получено %d байт", len(reply))
+                return reply
+            LOG.warning("Полный хэндшейк: получено %d байт (мин. %d)",
+                        len(reply) if reply else 0, HANDSHAKE_REPLY_LEN)
+            return None
+
+    def read_block_by_addr(self, addr: int) -> Optional[bytes]:
+        """Запрашивает блок по адресу из каталога: 0x42 + addr_lo + addr_hi.
+
+        Читает 16 байт header + payload (размер из TLV header).
+        Возвращает полные сырые данные блока (header + body).
+        """
+        with self._lock:
+            if not self.is_open:
+                return None
+            addr_lo = addr & 0xFF
+            addr_hi = (addr >> 8) & 0xFF
+            self._send_byte(OP_BLOCK_READ)
+            self._send_byte(addr_lo)
+            self._send_byte(addr_hi)
+            # Сначала читаем TLV header (4 байта: tag LE16 + length LE16)
+            hdr = self._read_bytes(TLV_HEADER_SIZE)
+            if len(hdr) < TLV_HEADER_SIZE:
+                return None
+            tag = struct.unpack_from('<H', hdr, 0)[0]
+            length = struct.unpack_from('<H', hdr, 2)[0]
+            if tag == TLV_PADDING_TAG or length == 0:
+                return None
+            body = self._read_bytes(length)
+            if len(body) < length:
+                LOG.warning("Блок 0x%04X: получено %d/%d байт тела", addr, len(body), length)
+            return hdr + body
+
     def request_block(self, block_len: int) -> Optional[bytes]:
         """Запрашивает блок данных: отправляет 0x42 + LL + HH, читает block_len байт."""
         # NOTE: No checksum/CRC validation on received block data - the original PelengPC
@@ -400,6 +449,27 @@ class PelengPort:
             "flash_size_kb": 512 if (ib & INFO_BIT_EXTENDED_FLASH) else 128,
             "lcd_size": LCD_SIZE_WAGON if (ib & INFO_BIT_WAGON_LCD) else LCD_SIZE_NORMAL,
         }
+
+
+def parse_catalog(handshake_reply: bytes) -> List[int]:
+    """Извлекает список LE16 адресов из ответа на полный хэндшейк.
+
+    Формат ответа: 16 байт header + каталог (массив LE16 адресов).
+    catalog_count = (len(reply) - 16) / 2 - 1.
+    Отфильтровывает 0xFFFF (padding).
+    """
+    if len(handshake_reply) <= HANDSHAKE_REPLY_LEN:
+        return []
+    catalog_bytes = handshake_reply[HANDSHAKE_REPLY_LEN:]
+    catalog_count = len(catalog_bytes) // 2 - 1
+    if catalog_count <= 0:
+        return []
+    addresses: List[int] = []
+    for i in range(catalog_count):
+        addr = struct.unpack_from('<H', catalog_bytes, i * 2)[0]
+        if addr != 0xFFFF:
+            addresses.append(addr)
+    return addresses
 
 
 class UD2_102Port(PelengPort):
@@ -1161,13 +1231,23 @@ class BlockZapDB:
         return self.filter_by_category(["CALIBRATION"])
 
     def import_fdb(self, fdb_path: str) -> int:
-        """Импорт записей из файла FDB (бинарный формат flash dump)."""
+        """Импорт записей из файла FDB/DAT (16-байт header + RAW flash dump)."""
         if not os.path.isfile(fdb_path):
             LOG.error("Файл не найден: %s", fdb_path)
             return 0
         with open(fdb_path, 'rb') as f:
             data = f.read()
-        tlv_records = TLVRecord.parse_all(data)
+        if len(data) < 17:
+            LOG.error("FDB файл слишком мал: %d байт (мин. 17)", len(data))
+            return 0
+        # Проверка "пустого" файла: LE16 по смещению 0x10 == 0xFFFF
+        if len(data) > 0x11 and struct.unpack_from('<H', data, 0x10)[0] == 0xFFFF:
+            LOG.warning("FDB файл пустой (0xFFFF по смещению 0x10)")
+            return 0
+        # Пропускаем 16-байтный handshake header
+        flash_data = data[16:]
+        # Парсим TLV-записи из flash dump
+        tlv_records = TLVRecord.parse_all(flash_data)
         count = 0
         for tlv in tlv_records:
             decoded = dispatch_decode(tlv)
@@ -1624,18 +1704,88 @@ def _create_gui_classes():
             self._statusbar.showMessage("\u0413\u043e\u0442\u043e\u0432")
 
         def _action_receive(self) -> None:
-            """Действие: Принять данные от прибора (F5)."""
+            """Действие: Принять данные от прибора (F5) -- полный приём по каталогу."""
+            # Открываем порт при необходимости
             if not self._port:
                 self._port = PelengPort(self._port_config)
             if not self._port.is_open:
                 if not self._port.open():
-                    self._statusbar.showMessage("\u041e\u0448\u0438\u0431\u043a\u0430 \u043e\u0442\u043a\u0440\u044b\u0442\u0438\u044f \u043f\u043e\u0440\u0442\u0430")
+                    self._statusbar.showMessage("Ошибка открытия порта")
                     return
-            reply = self._port.test_port()
-            if reply:
-                self._statusbar.showMessage(f"\u041f\u0440\u0438\u0431\u043e\u0440 \u043e\u0442\u0432\u0435\u0442\u0438\u043b: {reply.hex()}")
-            else:
-                self._statusbar.showMessage("\u041d\u0435\u0442 \u043e\u0442\u0432\u0435\u0442\u0430 \u043e\u0442 \u043f\u0440\u0438\u0431\u043e\u0440\u0430")
+            # Отправляем 0x55 и читаем полный ответ (header + каталог)
+            reply = self._port.handshake_full()
+            if reply is None or len(reply) < 17:
+                QMessageBox.warning(self, "Приём", "Нет ответа от прибора")
+                self._statusbar.showMessage("Нет ответа от прибора")
+                return
+            # Парсим info_byte
+            info_byte = reply[2] if len(reply) > 2 else 0
+            LOG.info("Приём: info_byte=0x%02X, всего %d байт", info_byte, len(reply))
+            # Извлекаем каталог адресов
+            catalog_addrs = parse_catalog(reply)
+            if not catalog_addrs:
+                QMessageBox.information(self, "Приём",
+                                        "Каталог пуст -- нет записей в приборе")
+                self._statusbar.showMessage("Каталог пуст")
+                return
+            self._statusbar.showMessage(
+                f"Чтение каталога... {len(catalog_addrs)} адресов"
+            )
+            # Открываем диалог прогресса приёма
+            self._recv_dialog = ReceiveProgressDialog(self)
+            self._recv_dialog.set_status(
+                f"Чтение каталога... {len(catalog_addrs)} адресов"
+            )
+            self._recv_dialog.show()
+            # Создаем QThread и воркер для фонового чтения блоков
+            self._recv_thread = QThread()
+            self._recv_worker = ReceiveWorker(self._port, catalog_addrs)
+            self._recv_worker.moveToThread(self._recv_thread)
+            # Соединяем сигналы воркера с обработчиками
+            self._recv_worker.progress.connect(self._recv_dialog.update_progress)
+            self._recv_worker.status.connect(self._recv_dialog.set_status)
+            self._recv_worker.record_found.connect(self._recv_dialog.add_record)
+            self._recv_worker.record_found.connect(self._on_receive_record_found)
+            self._recv_worker.finished.connect(self._on_receive_finished)
+            self._recv_worker.error.connect(self._on_receive_error)
+            # Кнопка "Остановить" устанавливает флаг отмены в воркере
+            self._recv_dialog.btn_stop.clicked.connect(self._recv_worker.abort)
+            # Запуск фонового потока
+            self._recv_thread.started.connect(self._recv_worker.run)
+            self._recv_thread.start()
+
+        def _on_receive_record_found(self, raw: bytes, decoded_info: str) -> None:
+            """Обработка найденной записи при приёме: вставка в БД."""
+            if self._db:
+                tlv = TLVRecord.parse(raw)
+                if tlv:
+                    decoded = dispatch_decode(tlv)
+                    self._db.upsert(decoded, tlv.raw)
+
+        def _on_receive_finished(self, count: int) -> None:
+            """Завершение приёма: закрытие диалога и обновление таблиц."""
+            if hasattr(self, '_recv_dialog') and self._recv_dialog:
+                self._recv_dialog.close()
+                self._recv_dialog = None
+            if hasattr(self, '_recv_thread') and self._recv_thread:
+                self._recv_thread.quit()
+                self._recv_thread.wait()
+                self._recv_thread = None
+            self._recv_worker = None
+            self._refresh_tables()
+            self._statusbar.showMessage(f"Приём завершён: получено {count} записей")
+
+        def _on_receive_error(self, msg: str) -> None:
+            """Обработка ошибки приёма."""
+            if hasattr(self, '_recv_dialog') and self._recv_dialog:
+                self._recv_dialog.close()
+                self._recv_dialog = None
+            if hasattr(self, '_recv_thread') and self._recv_thread:
+                self._recv_thread.quit()
+                self._recv_thread.wait()
+                self._recv_thread = None
+            self._recv_worker = None
+            QMessageBox.critical(self, "Приём", f"Ошибка приёма: {msg}")
 
         def _action_test_port(self) -> None:
             """Действие: Тест порта (F6)."""
@@ -1719,7 +1869,7 @@ def _create_gui_classes():
         def _action_import_fdb(self) -> None:
             """Действие: Импорт из FDB файла."""
             path, _ = QFileDialog.getOpenFileName(self, "\u0418\u043c\u043f\u043e\u0440\u0442 FDB",
-                                                   "", "Flash dump (*.bin *.fdb);;All (*)")
+                                                   "", "Flash dump (*.fdb *.dat *.bin);;All (*)")
             if path and self._db:
                 count = self._db.import_fdb(path)
                 self._refresh_tables()
@@ -1970,6 +2120,154 @@ def _create_gui_classes():
 
             # Адрес из сырых данных (первые 4 байта TLV: tag + length)
             addr_str = f"0x{len(raw):04X}" if len(raw) < 8 else f"{len(raw)} B"
+            self._table.setItem(row, 1, QTableWidgetItem(addr_str))
+
+            # Разбираем decoded_info (формат: "тип|дата|паспорт")
+            parts = decoded_info.split("|") if decoded_info else []
+            rec_type = parts[0] if len(parts) > 0 else ""
+            rec_date = parts[1] if len(parts) > 1 else ""
+            rec_passport = parts[2] if len(parts) > 2 else ""
+
+            self._table.setItem(row, 2, QTableWidgetItem(rec_type))
+            self._table.setItem(row, 3, QTableWidgetItem(rec_date))
+            self._table.setItem(row, 4, QTableWidgetItem(rec_passport))
+
+            # Прокрутка к последней строке
+            self._table.scrollToBottom()
+
+    # --------- ReceiveWorker: фоновый поток приёма данных (F5) ---------
+
+    class ReceiveWorker(QObject):
+        """Воркер для полного приёма данных с прибора в фоновом потоке."""
+
+        # Сигналы для обратной связи с GUI
+        progress = pyqtSignal(int, int)        # (текущий_индекс, общее_количество)
+        status = pyqtSignal(str)               # текстовое сообщение статуса
+        record_found = pyqtSignal(bytes, str)  # (сырые_данные, расшифрованная_информация)
+        finished = pyqtSignal(int)             # количество прочитанных записей
+        error = pyqtSignal(str)                # сообщение об ошибке
+
+        def __init__(self, port: PelengPort, catalog_addrs: List[int]):
+            """Инициализация воркера приёма данных по каталогу."""
+            super().__init__()
+            self._port = port
+            self._catalog_addrs = catalog_addrs
+            self._abort_flag = False
+
+        def abort(self) -> None:
+            """Установка флага прерывания приёма."""
+            self._abort_flag = True
+
+        def run(self) -> None:
+            """Основной цикл чтения блоков по адресам каталога."""
+            try:
+                total = len(self._catalog_addrs)
+                count = 0
+                for idx, addr in enumerate(self._catalog_addrs):
+                    if self._abort_flag:
+                        break
+                    self.status.emit(
+                        f"Чтение блока {idx + 1}/{total}: 0x{addr:04X}"
+                    )
+                    self.progress.emit(idx + 1, total)
+                    # Читаем блок по адресу
+                    raw = self._port.read_block_by_addr(addr)
+                    if raw is not None and len(raw) > TLV_HEADER_SIZE:
+                        count += 1
+                        decoded_info = self._make_decoded_info(raw)
+                        self.record_found.emit(raw, decoded_info)
+
+                self.finished.emit(count)
+            except Exception as e:
+                self.error.emit(str(e))
+
+        def _make_decoded_info(self, raw: bytes) -> str:
+            """Формирование строки с информацией о записи для отображения."""
+            try:
+                tlv = TLVRecord.parse(raw)
+                if tlv is None:
+                    return ""
+                decoded = dispatch_decode(tlv)
+                parts = []
+                if decoded.category_name:
+                    parts.append(decoded.category_name)
+                if decoded.date:
+                    parts.append(decoded.date.strftime("%d.%m.%Y"))
+                if decoded.passport_primary:
+                    parts.append(decoded.passport_primary)
+                return "|".join(parts)
+            except Exception:
+                return ""
+
+    # --------- ReceiveProgressDialog: диалог прогресса приёма данных ---------
+
+    class ReceiveProgressDialog(QDialog):
+        """Диалог отображения прогресса приёма данных от прибора."""
+
+        def __init__(self, parent=None):
+            """Инициализация диалога прогресса приёма."""
+            super().__init__(parent)
+            self.setWindowTitle("Приём данных от прибора")
+            self.setMinimumSize(700, 400)
+            self.setModal(True)
+            self._record_count = 0
+            self._init_ui()
+
+        def _init_ui(self) -> None:
+            """Создание элементов интерфейса диалога приёма."""
+            layout = QVBoxLayout(self)
+
+            # Метка статуса
+            self._lbl_status = QLabel("Чтение каталога...")
+            layout.addWidget(self._lbl_status)
+
+            # Прогресс-бар
+            self._progress_bar = QProgressBar()
+            self._progress_bar.setMinimum(0)
+            self._progress_bar.setMaximum(100)
+            self._progress_bar.setValue(0)
+            layout.addWidget(self._progress_bar)
+
+            # Метка количества найденных записей
+            self._lbl_count = QLabel("Найдено записей: 0")
+            layout.addWidget(self._lbl_count)
+
+            # Таблица найденных записей
+            self._table = QTableWidget()
+            self._table.setColumnCount(5)
+            self._table.setHorizontalHeaderLabels([
+                "\u2116", "Адрес", "Тип", "Дата", "Паспорт"
+            ])
+            self._table.horizontalHeader().setStretchLastSection(True)
+            layout.addWidget(self._table)
+
+            # Кнопка "Остановить"
+            self.btn_stop = QPushButton("Остановить")
+            layout.addWidget(self.btn_stop)
+
+        def set_status(self, text: str) -> None:
+            """Обновление текста статуса."""
+            self._lbl_status.setText(text)
+
+        def update_progress(self, current: int, total: int) -> None:
+            """Обновление прогресс-бара."""
+            self._progress_bar.setMaximum(total)
+            self._progress_bar.setValue(current)
+            self._lbl_status.setText(
+                f"Чтение блока {current}/{total}"
+            )
+
+        def add_record(self, raw: bytes, decoded_info: str) -> None:
+            """Добавление найденной записи в таблицу."""
+            self._record_count += 1
+            self._lbl_count.setText(f"Найдено записей: {self._record_count}")
+
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            self._table.setItem(row, 0, QTableWidgetItem(str(self._record_count)))
+
+            # Адрес из размера данных
+            addr_str = f"{len(raw)} B"
             self._table.setItem(row, 1, QTableWidgetItem(addr_str))
 
             # Разбираем decoded_info (формат: "тип|дата|паспорт")
