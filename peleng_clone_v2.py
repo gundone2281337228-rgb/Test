@@ -43,9 +43,11 @@ _OPENPYXL_AVAILABLE = False
 
 try:
     import serial
+    from serial.tools import list_ports as _list_ports
     _SERIAL_AVAILABLE = True
 except ImportError:
     serial = None  # type: ignore
+    _list_ports = None  # type: ignore
 
 try:
     from PyQt6.QtWidgets import (
@@ -1649,9 +1651,21 @@ def _create_gui_classes():
 
         def _action_port_settings(self) -> None:
             """Действие: Настройка COM-порта."""
-            dlg = PortDialog(self, self._port_config)
+            # Используем реальный диалог PortDialogImpl вместо заглушки
+            _, _, PortDialogReal = _create_dialog_classes()
+            if PortDialogReal is None:
+                return
+            dlg = PortDialogReal(self, self._port_config)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self._port_config = dlg.get_config()
+                # Закрываем старый порт, чтобы при следующем использовании
+                # он был пересоздан с новыми настройками
+                if self._port is not None:
+                    try:
+                        self._port.close()
+                    except Exception:
+                        pass
+                    self._port = None
                 self._statusbar.showMessage(
                     f"\u041f\u043e\u0440\u0442: {self._port_config.port_name} @ {self._port_config.baud_rate}")
 
@@ -2463,8 +2477,25 @@ def _create_dialog_classes():
             """Инициализация интерфейса диалога порта."""
             layout = QFormLayout(self)
 
-            self._port_edit = QLineEdit(self._config.port_name)
-            layout.addRow("\u041f\u043e\u0440\u0442:", self._port_edit)
+            # Выпадающий список COM-портов (с возможностью ручного ввода)
+            self._port_combo = QComboBox()
+            self._port_combo.setEditable(True)
+            # Перечисление доступных COM-портов через pyserial
+            if _list_ports is not None:
+                try:
+                    ports = _list_ports.comports()
+                    for p in sorted(ports, key=lambda x: x.device):
+                        self._port_combo.addItem(f"{p.device} - {p.description}", p.device)
+                except Exception:
+                    pass
+            # Если портов не найдено, добавляем типовые имена
+            if self._port_combo.count() == 0:
+                for name in ["COM1", "COM2", "COM3", "COM4",
+                             "/dev/ttyUSB0", "/dev/ttyACM0"]:
+                    self._port_combo.addItem(name, name)
+            # Устанавливаем текущее значение из конфигурации
+            self._port_combo.setCurrentText(self._config.port_name)
+            layout.addRow("\u041f\u043e\u0440\u0442:", self._port_combo)
 
             self._baud_combo = QComboBox()
             self._baud_combo.addItems(["19200", "57600", "9600", "115200"])
@@ -2491,7 +2522,13 @@ def _create_dialog_classes():
         def get_config(self) -> PortConfig:
             """Возвращает конфигурацию порта из диалога."""
             config = PortConfig()
-            config.port_name = self._port_edit.text()
+            # Если выбран элемент из списка, берем device из userData, иначе текст
+            idx = self._port_combo.currentIndex()
+            user_data = self._port_combo.itemData(idx) if idx >= 0 else None
+            if user_data:
+                config.port_name = user_data
+            else:
+                config.port_name = self._port_combo.currentText()
             config.baud_rate = int(self._baud_combo.currentText())
             parity_text = self._parity_combo.currentText()
             if "E" in parity_text:
