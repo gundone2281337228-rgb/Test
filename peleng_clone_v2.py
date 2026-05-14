@@ -58,7 +58,7 @@ try:
         QHeaderView, QAbstractItemView, QGroupBox, QFormLayout, QTextEdit,
         QProgressDialog
     )
-    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRect, QPoint, QSize
+    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRect, QPoint, QSize, QObject
     from PyQt6.QtGui import (
         QAction, QPixmap, QImage, QPainter, QPen, QBrush, QColor, QFont,
         QPolygonF, QKeySequence, QPainterPath
@@ -1758,24 +1758,233 @@ def _create_gui_classes():
                 QMessageBox.warning(self, "UD2-102", "\u041d\u0435\u0442 \u043e\u0442\u0432\u0435\u0442\u0430")
 
         def _action_ud2_scan(self) -> None:
-            """Действие: Сканирование памяти UD2-102."""
+            """Действие: Сканирование памяти UD2-102 (асинхронно через QThread)."""
             ud2 = UD2_102Port(self._port_config)
             if not ud2.is_open:
-                ud2.open()
-            records = ud2.scan_memory()
+                if not ud2.open():
+                    QMessageBox.warning(self, "UD2-102", "Не удалось открыть порт")
+                    return
+
+            # Создаем диалог прогресса сканирования
+            self._scan_dialog = ScanProgressDialog(self)
+            self._scan_dialog.show()
+
+            # Создаем QThread и воркер для фонового сканирования
+            self._scan_thread = QThread()
+            self._scan_worker = ScanWorker(ud2, start_addr=0, end_addr=0xFFFF)
+            self._scan_worker.moveToThread(self._scan_thread)
+
+            # Соединяем сигналы воркера с обработчиками
+            self._scan_worker.progress.connect(self._scan_dialog.update_progress)
+            self._scan_worker.record_found.connect(self._scan_dialog.add_record)
+            self._scan_worker.record_found.connect(self._on_scan_record_found)
+            self._scan_worker.finished.connect(self._on_scan_finished)
+            self._scan_worker.error.connect(self._on_scan_error)
+
+            # Кнопка "Остановить" устанавливает флаг отмены в воркере
+            self._scan_dialog.btn_stop.clicked.connect(self._scan_worker.abort)
+
+            # Запуск фонового потока
+            self._scan_thread.started.connect(self._scan_worker.run)
+            self._scan_thread.start()
+
+        def _on_scan_record_found(self, raw: bytes, decoded_info: str) -> None:
+            """Обработка найденной записи: вставка в БД."""
             if self._db:
-                for raw in records:
-                    tlv = TLVRecord.parse(raw)
-                    if tlv:
-                        decoded = dispatch_decode(tlv)
-                        self._db.upsert(decoded, tlv.raw)
-                self._refresh_tables()
-            self._statusbar.showMessage(f"UD2-102: \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u043e {len(records)} \u0437\u0430\u043f\u0438\u0441\u0435\u0439")
+                tlv = TLVRecord.parse(raw)
+                if tlv:
+                    decoded = dispatch_decode(tlv)
+                    self._db.upsert(decoded, tlv.raw)
+
+        def _on_scan_finished(self, count: int) -> None:
+            """Завершение сканирования: закрытие диалога и обновление таблиц."""
+            if hasattr(self, '_scan_dialog') and self._scan_dialog:
+                self._scan_dialog.close()
+                self._scan_dialog = None
+            if hasattr(self, '_scan_thread') and self._scan_thread:
+                self._scan_thread.quit()
+                self._scan_thread.wait()
+                self._scan_thread = None
+            self._scan_worker = None
+            self._refresh_tables()
+            self._statusbar.showMessage(f"UD2-102: получено {count} записей")
+
+        def _on_scan_error(self, msg: str) -> None:
+            """Обработка ошибки сканирования."""
+            if hasattr(self, '_scan_dialog') and self._scan_dialog:
+                self._scan_dialog.close()
+                self._scan_dialog = None
+            if hasattr(self, '_scan_thread') and self._scan_thread:
+                self._scan_thread.quit()
+                self._scan_thread.wait()
+                self._scan_thread = None
+            self._scan_worker = None
+            QMessageBox.critical(self, "UD2-102", f"Ошибка сканирования: {msg}")
 
         def _action_edit_settings(self) -> None:
             """Действие: Редактирование настроек."""
             QMessageBox.information(self, "\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438",
                                     "\u0420\u0435\u0434\u0430\u043a\u0442\u043e\u0440 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a \u0432 \u0440\u0430\u0437\u0440\u0430\u0431\u043e\u0442\u043a\u0435")
+
+
+    # --------- ScanWorker: фоновый поток сканирования памяти ---------
+
+    class ScanWorker(QObject):
+        """Воркер для сканирования памяти UD2-102 в фоновом потоке."""
+
+        # Сигналы для обратной связи с GUI
+        progress = pyqtSignal(int, int)        # (текущий_адрес, конечный_адрес)
+        record_found = pyqtSignal(bytes, str)  # (сырые_данные, расшифрованная_информация)
+        finished = pyqtSignal(int)             # количество найденных записей
+        error = pyqtSignal(str)                # сообщение об ошибке
+
+        def __init__(self, ud2: UD2_102Port, start_addr: int = 0,
+                     end_addr: int = 0xFFFF):
+            """Инициализация воркера сканирования."""
+            super().__init__()
+            self._ud2 = ud2
+            self._start_addr = start_addr
+            self._end_addr = end_addr
+            self._abort_flag = False
+            self._max_streak = 100
+
+        def abort(self) -> None:
+            """Установка флага прерывания сканирования."""
+            self._abort_flag = True
+
+        def run(self) -> None:
+            """Основной цикл сканирования (выполняется в фоновом потоке)."""
+            try:
+                count = 0
+                streak = 0
+                addr = self._start_addr
+                while addr <= self._end_addr:
+                    # Проверяем флаг отмены
+                    if self._abort_flag:
+                        break
+
+                    lo = addr & 0xFF
+                    hi = (addr >> 8) & 0xFF
+                    rec = self._ud2.read_record(lo, hi)
+
+                    if rec is None:
+                        streak += 1
+                        if streak >= self._max_streak:
+                            break
+                    else:
+                        streak = 0
+                        count += 1
+                        # Декодируем для отображения в таблице
+                        decoded_info = self._make_decoded_info(rec)
+                        self.record_found.emit(rec, decoded_info)
+
+                    addr += 1
+                    # Отправляем прогресс каждые 16 адресов для снижения нагрузки
+                    if addr % 16 == 0:
+                        self.progress.emit(addr, self._end_addr)
+
+                self.finished.emit(count)
+            except Exception as e:
+                self.error.emit(str(e))
+
+        def _make_decoded_info(self, raw: bytes) -> str:
+            """Формирование строки с информацией о записи для отображения."""
+            try:
+                tlv = TLVRecord.parse(raw)
+                if tlv is None:
+                    return ""
+                decoded = dispatch_decode(tlv)
+                parts = []
+                if decoded.category_name:
+                    parts.append(decoded.category_name)
+                if decoded.date:
+                    parts.append(decoded.date.strftime("%d.%m.%Y"))
+                if decoded.passport_primary:
+                    parts.append(decoded.passport_primary)
+                return "|".join(parts)
+            except Exception:
+                return ""
+
+    # --------- ScanProgressDialog: диалог прогресса сканирования ---------
+
+    class ScanProgressDialog(QDialog):
+        """Диалог отображения прогресса сканирования памяти UD2-102."""
+
+        def __init__(self, parent=None):
+            """Инициализация диалога прогресса с таблицей найденных записей."""
+            super().__init__(parent)
+            self.setWindowTitle("Сканирование памяти UD2-102")
+            self.setMinimumSize(700, 400)
+            self.setModal(True)
+            self._record_count = 0
+            self._init_ui()
+
+        def _init_ui(self) -> None:
+            """Создание элементов интерфейса диалога."""
+            layout = QVBoxLayout(self)
+
+            # Метка текущего адреса
+            self._lbl_status = QLabel("Адрес: 0x0000 / 0xFFFF")
+            layout.addWidget(self._lbl_status)
+
+            # Прогресс-бар
+            self._progress_bar = QProgressBar()
+            self._progress_bar.setMinimum(0)
+            self._progress_bar.setMaximum(0xFFFF)
+            self._progress_bar.setValue(0)
+            layout.addWidget(self._progress_bar)
+
+            # Метка количества найденных записей
+            self._lbl_count = QLabel("Найдено записей: 0")
+            layout.addWidget(self._lbl_count)
+
+            # Таблица найденных записей
+            self._table = QTableWidget()
+            self._table.setColumnCount(5)
+            self._table.setHorizontalHeaderLabels([
+                "№", "Адрес", "Тип", "Дата", "Паспорт"
+            ])
+            self._table.horizontalHeader().setStretchLastSection(True)
+            layout.addWidget(self._table)
+
+            # Кнопка "Остановить"
+            self.btn_stop = QPushButton("Остановить")
+            layout.addWidget(self.btn_stop)
+
+        def update_progress(self, current_addr: int, end_addr: int) -> None:
+            """Обновление прогресс-бара и метки адреса."""
+            self._progress_bar.setMaximum(end_addr)
+            self._progress_bar.setValue(current_addr)
+            self._lbl_status.setText(
+                f"Адрес: 0x{current_addr:04X} / 0x{end_addr:04X}"
+            )
+
+        def add_record(self, raw: bytes, decoded_info: str) -> None:
+            """Добавление найденной записи в таблицу."""
+            self._record_count += 1
+            self._lbl_count.setText(f"Найдено записей: {self._record_count}")
+
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            self._table.setItem(row, 0, QTableWidgetItem(str(self._record_count)))
+
+            # Адрес из сырых данных (первые 4 байта TLV: tag + length)
+            addr_str = f"0x{len(raw):04X}" if len(raw) < 8 else f"{len(raw)} B"
+            self._table.setItem(row, 1, QTableWidgetItem(addr_str))
+
+            # Разбираем decoded_info (формат: "тип|дата|паспорт")
+            parts = decoded_info.split("|") if decoded_info else []
+            rec_type = parts[0] if len(parts) > 0 else ""
+            rec_date = parts[1] if len(parts) > 1 else ""
+            rec_passport = parts[2] if len(parts) > 2 else ""
+
+            self._table.setItem(row, 2, QTableWidgetItem(rec_type))
+            self._table.setItem(row, 3, QTableWidgetItem(rec_date))
+            self._table.setItem(row, 4, QTableWidgetItem(rec_passport))
+
+            # Прокрутка к последней строке
+            self._table.scrollToBottom()
+
 
     return PelengMainWindow
 
