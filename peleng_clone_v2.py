@@ -980,8 +980,12 @@ def dispatch_decode(tlv: TLVRecord) -> DecodedRecord:
     """Диспетчер декодирования: определяет тип записи и вызывает соответствующий декодер."""
     body = tlv.body
     if len(body) < 0x12:
+        # Тело слишком короткое для полного декодирования, но ставим категорию UNKNOWN
+        # чтобы запись не потерялась при фильтрации (пустая строка не попадает ни в один фильтр)
         rec = DecodedRecord()
         rec.raw_body = body
+        rec.category_name = "UNKNOWN"
+        rec.decoder_type = 0
         return rec
     sweep_addr = struct.unpack_from('<H', body, BODY_OFFSET_SWEEP_ADDR)[0]
     cat_name, dec_type = get_category(sweep_addr)
@@ -1242,8 +1246,8 @@ class BlockZapDB:
         return self.filter_by_category(["A_SCAN", "B_SCAN"])
 
     def filter_reports(self) -> List[Dict[str, Any]]:
-        """Возвращает записи отчетов (Generic, ShortProto)."""
-        return self.filter_by_category(["GENERIC", "SHORT_PROTO"])
+        """Возвращает записи отчетов (Generic, ShortProto, а также UNKNOWN и нераспознанные)."""
+        return self.filter_by_category(["GENERIC", "SHORT_PROTO", "UNKNOWN", ""])
 
     def filter_settings(self) -> List[Dict[str, Any]]:
         """Возвращает записи настроек (Calibration)."""
@@ -1252,42 +1256,54 @@ class BlockZapDB:
     def import_fdb(self, fdb_path: str) -> int:
         """Импорт записей из файла FDB (Firebird 2.x база данных PelengPC).
 
-        PelengPC хранит данные в Firebird Embedded DB (gds32.dll).
-        Файл .fdb -- это база Firebird 2.x (ODS 11.0).
-        Если пакет fdb недоступен, пробуем как бинарный flash dump.
+        Стратегия (БЕЗ обязательного fbembed):
+        1. Попытка через пакет fdb с автоопределением библиотеки (без load_api)
+        2. Бинарное сканирование .fdb файла на TLV-записи напрямую
+        3. Парсинг как flash dump (16-byte header + TLV поток)
         """
         if not os.path.isfile(fdb_path):
             LOG.error("Файл не найден: %s", fdb_path)
             return 0
 
-        # Попытка 1: Firebird database через пакет fdb
+        # Попытка 1: Firebird database через пакет fdb (без обязательного fbembed)
         try:
             import fdb as _fdb
-            # Поиск клиентской библиотеки Firebird
-            fb_lib = None
-            for candidate in [
-                os.environ.get('PELENG_FBCLIENT', ''),
-                str(Path.home() / '.peleng_clone' / 'fb25' / 'fbembed.dll'),
-                'fbembed.dll', 'fbclient.dll',
-                '/usr/lib/libfbembed.so.2.5',
-                '/usr/lib/x86_64-linux-gnu/libfbclient.so',
-            ]:
-                if candidate and os.path.isfile(candidate):
-                    fb_lib = candidate
-                    break
-            if fb_lib and getattr(_fdb, 'api', None) is None:
-                _fdb.load_api(fb_lib)
+            # Пробуем подключиться БЕЗ явного load_api -- fdb сам найдет
+            # fbclient.dll/libfbclient.so если они в PATH/LD_LIBRARY_PATH
+            try:
+                conn = _fdb.connect(
+                    dsn=fdb_path,
+                    user='SYSDBA',
+                    password='masterkey',
+                    charset='WIN1251'
+                )
+            except Exception:
+                # Если не сработало -- попробуем указать путь к embedded
+                fb_lib = None
+                for candidate in [
+                    os.environ.get('PELENG_FBCLIENT', ''),
+                    str(Path.home() / '.peleng_clone' / 'fb25' / 'fbembed.dll'),
+                    'fbembed.dll', 'fbclient.dll',
+                    '/usr/lib/libfbembed.so.2.5',
+                    '/usr/lib/x86_64-linux-gnu/libfbclient.so',
+                ]:
+                    if candidate and os.path.isfile(candidate):
+                        fb_lib = candidate
+                        break
+                if not fb_lib:
+                    raise ImportError("fbclient не найден")
+                if getattr(_fdb, 'api', None) is None:
+                    _fdb.load_api(fb_lib)
+                conn = _fdb.connect(
+                    dsn=fdb_path,
+                    user='SYSDBA',
+                    password='masterkey',
+                    charset='WIN1251'
+                )
 
-            conn = _fdb.connect(
-                dsn=fdb_path,
-                user='SYSDBA',
-                password='masterkey',
-                charset='WIN1251'
-            )
             count = 0
-            # Читаем таблицу BLOCKZAP (основное хранилище блоков)
             cursor = conn.cursor()
-            # Пробуем несколько вариантов имён таблиц (вагонная/рельсовая/ОТД)
+            # Пробуем несколько вариантов имен таблиц (вагонная/рельсовая/ОТД)
             for suffix in ('1', '2', '3', ''):
                 table_name = f'BLOCKZAP{suffix}' if suffix else 'BLOCKZAP'
                 try:
@@ -1306,23 +1322,29 @@ class BlockZapDB:
                     LOG.debug("Таблица %s: %s", table_name, e)
                     continue
             conn.close()
-            LOG.info("FDB импорт: %d записей из %s", count, fdb_path)
+            LOG.info("FDB импорт (Firebird): %d записей из %s", count, fdb_path)
             return count
 
         except ImportError:
-            LOG.warning("Пакет fdb не установлен, пробую бинарный формат")
+            LOG.info("Пакет fdb не установлен, пробую бинарное сканирование")
         except Exception as e:
-            LOG.warning("FDB подключение не удалось (%s), пробую бинарный формат", e)
+            LOG.info("FDB подключение не удалось (%s), пробую бинарное сканирование", e)
 
-        # Попытка 2: бинарный flash dump (16-байт header + raw flash)
+        # Попытка 2: бинарное сканирование .fdb файла на TLV-записи
+        # Firebird хранит BLOB данные в страницах "как есть", поэтому TLV-записи
+        # можно найти прямым сканированием файла без клиентской библиотеки
         with open(fdb_path, 'rb') as f:
             data = f.read()
         if len(data) < 17:
             LOG.error("Файл слишком мал: %d байт", len(data))
             return 0
 
-        count = 0
-        # Пробуем парсить как TLV с разных смещений
+        count = self._extract_tlv_from_binary(data)
+        if count > 0:
+            LOG.info("Бинарное сканирование FDB: %d записей из %s", count, fdb_path)
+            return count
+
+        # Попытка 3: парсинг как flash dump (16-байт header + raw TLV поток)
         for skip in (0, 16):
             flash_data = data[skip:]
             tlv_records = TLVRecord.parse_all(flash_data)
@@ -1336,7 +1358,73 @@ class BlockZapDB:
         if count == 0:
             LOG.warning("Не удалось распознать формат файла %s", fdb_path)
         else:
-            LOG.info("Бинарный импорт: %d записей из %s", count, fdb_path)
+            LOG.info("Flash dump импорт: %d записей из %s", count, fdb_path)
+        return count
+
+    def _extract_tlv_from_binary(self, data: bytes) -> int:
+        """Извлечение TLV-записей из бинарного файла FDB прямым сканированием.
+
+        Сканирует файл на наличие валидных TLV-записей без Firebird клиента.
+        Работает благодаря тому что BLOB данные хранятся в страницах FDB как есть.
+        Проверяет: tag в диапазоне sweep_addr (1000-29999), разумная длина,
+        sweep_addr в body совпадает с tag по семейству.
+        """
+        count = 0
+        offset = 0
+        file_len = len(data)
+
+        while offset < file_len - TLV_HEADER_SIZE:
+            # Читаем потенциальный TLV заголовок
+            tag = struct.unpack_from('<H', data, offset)[0]
+
+            # Пропуск padding и нулей
+            if tag == TLV_PADDING_TAG or tag == 0:
+                offset += 2
+                continue
+
+            # tag должен быть валидным sweep_addr (диапазон 1000-29999)
+            if not (1000 <= tag <= 29999):
+                offset += 1
+                continue
+
+            length = struct.unpack_from('<H', data, offset + 2)[0]
+
+            # Длина должна быть разумной: минимум 0x12 (чтобы содержать sweep_addr),
+            # максимум 8192 байт (самая большая запись -- B-scan ~4K)
+            if length < 0x12 or length > 8192:
+                offset += 1
+                continue
+
+            # Проверяем что хватает данных
+            if offset + TLV_HEADER_SIZE + length > file_len:
+                offset += 1
+                continue
+
+            body = data[offset + TLV_HEADER_SIZE: offset + TLV_HEADER_SIZE + length]
+
+            # Дополнительная валидация: sweep_addr внутри body (смещение 0x10)
+            # должен совпадать с tag или быть в том же семействе (sweep_addr//1000 == tag//1000)
+            body_sweep = struct.unpack_from('<H', body, BODY_OFFSET_SWEEP_ADDR)[0]
+            if body_sweep != tag and (body_sweep // 1000 != tag // 1000):
+                offset += 1
+                continue
+
+            # Дополнительная проверка: дата должна быть правдоподобной
+            # body[7]=день (1-31), body[8]=месяц (1-12), body[9]=год (0-99)
+            day = body[BODY_OFFSET_DATE_DAY] if len(body) > BODY_OFFSET_DATE_DAY else 0
+            month = body[BODY_OFFSET_DATE_DAY + 1] if len(body) > BODY_OFFSET_DATE_DAY + 1 else 0
+            if not (1 <= day <= 31 and 1 <= month <= 12):
+                offset += 1
+                continue
+
+            # Все проверки пройдены -- это валидная TLV запись
+            raw = data[offset: offset + TLV_HEADER_SIZE + length]
+            tlv = TLVRecord(tag=tag, length=length, body=body, raw=raw)
+            decoded = dispatch_decode(tlv)
+            self.upsert(decoded, tlv.raw)
+            count += 1
+            offset += TLV_HEADER_SIZE + length
+
         return count
 
     def export_to_path(self, out_path: str) -> bool:
@@ -1968,9 +2056,9 @@ def _create_gui_classes():
                     QMessageBox.warning(self, "\u0418\u043c\u043f\u043e\u0440\u0442 FDB",
                         "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0437\u0430\u043f\u0438\u0441\u0438.\n\n"
                         "\u0412\u043e\u0437\u043c\u043e\u0436\u043d\u044b\u0435 \u043f\u0440\u0438\u0447\u0438\u043d\u044b:\n"
-                        "\u2022 \u0414\u043b\u044f .fdb \u043d\u0443\u0436\u0435\u043d \u043f\u0430\u043a\u0435\u0442: pip install fdb\n"
-                        "\u2022 \u041d\u0443\u0436\u043d\u0430 \u0431\u0438\u0431\u043b\u0438\u043e\u0442\u0435\u043a\u0430 Firebird 2.5 (fbembed.dll)\n"
-                        "\u2022 \u0424\u0430\u0439\u043b \u043f\u0443\u0441\u0442 \u0438\u043b\u0438 \u043f\u043e\u0432\u0440\u0435\u0436\u0434\u0451\u043d")
+                        "\u2022 \u0424\u0430\u0439\u043b \u043d\u0435 \u0441\u043e\u0434\u0435\u0440\u0436\u0438\u0442 \u0437\u0430\u043f\u0438\u0441\u0435\u0439 \u0411\u041b\u041e\u041a\u0417\u0410\u041f\n"
+                        "\u2022 \u0424\u0430\u0439\u043b \u043f\u0443\u0441\u0442 \u0438\u043b\u0438 \u043f\u043e\u0432\u0440\u0435\u0436\u0434\u0451\u043d\n"
+                        "\u2022 \u0424\u043e\u0440\u043c\u0430\u0442 \u043d\u0435 \u0440\u0430\u0441\u043f\u043e\u0437\u043d\u0430\u043d (Firebird 2.x / flash dump)")
 
         def _action_export_excel(self) -> None:
             """Действие: Экспорт в Excel."""
