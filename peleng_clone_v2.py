@@ -1059,6 +1059,87 @@ PELENG_BODY_FIELDS: Dict[str, Tuple[int, int, str]] = {
 # ============= 4. DATABASE (SQLite) =============
 
 
+def _strip_unprintable(s: str) -> str:
+    """Remove control characters from FDB strings."""
+    if not s:
+        return s
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if o < 0x20 and o not in (0x09, 0x0A, 0x0D):
+            continue
+        if o == 0x7F:
+            continue
+        if 0x80 <= o <= 0x9F:
+            continue
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def _opt_int(v) -> Optional[int]:
+    """FDB value to int or None."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_str(v) -> Optional[str]:
+    """FDB value to string with cp1251 handling."""
+    if v is None:
+        return None
+    if isinstance(v, bytes):
+        for enc in ("cp1251", "utf-8"):
+            try:
+                s = v.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            s = v.hex()
+    else:
+        s = str(v)
+    s = _strip_unprintable(s.rstrip(" \x00"))
+    return s if s else None
+
+
+def _date_iso(v) -> Optional[str]:
+    """Convert datetime/date/string to 'YYYY-MM-DD'. Handles DD.MM.YYYY strings."""
+    if v is None:
+        return None
+    if isinstance(v, _dt.datetime):
+        return v.date().isoformat()
+    if isinstance(v, _dt.date):
+        return v.isoformat()
+    s = _opt_str(v)
+    if not s:
+        return None
+    # Try DD.MM.YYYY format
+    parts = s.strip().split(".")
+    if len(parts) == 3 and len(parts[2]) == 4:
+        try:
+            return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+        except Exception:
+            pass
+    return s
+
+
+def _fdb_make_year(maketime) -> int:
+    """Extract year from MAKETIME integer (YYYYMM or YYYY format)."""
+    if not maketime:
+        return 0
+    v = int(maketime)
+    if v >= 190000:  # YYYYMM
+        return v // 100
+    if 1900 <= v <= 2100:  # plain YYYY
+        return v
+    return 0
+
+
 class BlockZapDB:
     """SQLite-хранилище записей дефектоскопа (аналог Firebird BlockZap)."""
 
@@ -1312,51 +1393,108 @@ class BlockZapDB:
 
             count = 0
             cursor = conn.cursor()
-            # Пробуем несколько вариантов имен таблиц (вагонная/рельсовая/ОТД)
-            for suffix in ('1', '2', '3', ''):
-                table_name = f'BLOCKZAP{suffix}' if suffix else 'BLOCKZAP'
-                try:
-                    cursor.execute(f'SELECT BLOCK_BLOB FROM {table_name}')
-                    for row in cursor:
-                        blob_data = row[0]
-                        if blob_data and len(blob_data) > TLV_HEADER_SIZE:
-                            if isinstance(blob_data, str):
-                                blob_data = blob_data.encode('cp1251')
-                            tlv = TLVRecord.parse(bytes(blob_data))
-                            if tlv:
-                                decoded = dispatch_decode(tlv)
-                                self.upsert(decoded, tlv.raw)
-                                count += 1
-                except Exception as e:
-                    LOG.debug("Таблица %s: %s", table_name, e)
-                    continue
-            # Также читаем таблицы результатов (RESULTS, SHORTPROT, NASTR)
-            # В этих таблицах данные хранятся в текстовых полях (CP1251)
-            for suffix in ('2', '1', '3', ''):
-                for base_table in ('RESULTS', 'SHORTPROT', 'NASTR'):
-                    table_name = f'{base_table}{suffix}' if suffix else base_table
+            # Phase A: Read text-field tables (NASTR/RESULTS/SHORTPROT)
+            for suffix in ('2', '1', '3'):
+                for base_table in ('NASTR', 'RESULTS', 'SHORTPROT'):
+                    table_name = f'{base_table}{suffix}'
                     try:
                         cursor.execute(f'SELECT * FROM {table_name}')
                         col_names = [desc[0].upper() for desc in cursor.description]
                         for row in cursor:
                             row_dict = dict(zip(col_names, row))
-                            # Ищем BLOB поле (BLOCK_BLOB, BLOB, DATA)
-                            blob_data = None
-                            for blob_col in ('BLOCK_BLOB', 'BLOB', 'DATA', 'RAW_DATA'):
-                                if blob_col in row_dict and row_dict[blob_col]:
-                                    blob_data = row_dict[blob_col]
+                            # Handle BlobReader objects
+                            for k, val in list(row_dict.items()):
+                                if hasattr(val, 'read'):
+                                    try:
+                                        row_dict[k] = val.read()
+                                    except Exception:
+                                        row_dict[k] = None
+
+                            number = _opt_int(row_dict.get('NUMBER')) or 0
+                            if number <= 0:
+                                continue
+
+                            # Extract fields
+                            date_iso = _date_iso(row_dict.get('DATEFORM')) or ""
+                            time_str = _opt_str(row_dict.get('TIMEFORM')) or ""
+                            type_var = _opt_int(row_dict.get('TYPEVAR'))
+                            type_zap = _opt_str(row_dict.get('TYPEZAP')) or ""
+                            type_name = type_zap or (f"TypeVar={type_var}" if type_var else "")
+
+                            num_obj = _opt_str(row_dict.get('NUMOBJ')) or ""
+                            smelting = _opt_str(row_dict.get('SMELTING')) or ""
+                            ind_maker = _opt_str(row_dict.get('INDMAKER')) or ""
+                            make_time = _opt_int(row_dict.get('MAKETIME'))
+                            defekt = _opt_str(row_dict.get('DEFEKT')) or ""
+                            code_def = _opt_str(row_dict.get('CODEDEF')) or ""
+                            name_opera = _opt_str(row_dict.get('NAMEOPERA')) or ""
+
+                            # Date as "YYYY-MM-DD HH:MM"
+                            if date_iso and time_str:
+                                date_full = f"{date_iso} {time_str[:5]}"
+                            else:
+                                date_full = date_iso or time_str or ""
+
+                            # Parse PROTOCOL/BCDDATA blob for side/sheika/etc
+                            side = sheika = obod = obtochka = greben = naplavka = ""
+                            stamp = 0
+                            god = 0
+                            for blob_key in ('PROTOCOL', 'BCDDATA', 'DATA'):
+                                bcd_blob = row_dict.get(blob_key)
+                                if isinstance(bcd_blob, (bytes, bytearray)) and len(bcd_blob) >= 70:
                                     break
-                            if blob_data:
-                                if isinstance(blob_data, str):
-                                    blob_data = blob_data.encode('cp1251')
-                                tlv = TLVRecord.parse(bytes(blob_data))
-                                if tlv:
-                                    decoded = dispatch_decode(tlv)
-                                    self.upsert(decoded, tlv.raw)
-                                    count += 1
+
+                            addr = 0xF0000000 | number
+                            source = f"FDB-{base_table}"
+
+                            fields = {
+                                "date_str": date_full,
+                                "time_str": time_str,
+                                "type_name": type_name,
+                                "num_obj": num_obj,
+                                "plavka": smelting,
+                                "stamp": str(stamp) if stamp else "",
+                                "god": str(_fdb_make_year(make_time)) if make_time else "",
+                                "side": side,
+                                "sheika": sheika,
+                                "obod": obod,
+                                "obtochka": obtochka,
+                                "greben": greben,
+                                "naplavka": naplavka,
+                                "source": source,
+                                "defekt": defekt,
+                                "code_def": code_def,
+                                "operator": name_opera,
+                                "make_time": str(make_time) if make_time else "",
+                                "ind_maker": ind_maker,
+                            }
+                            self.upsert_measurement(addr, fields, b"")
+                            count += 1
                     except Exception as e:
-                        LOG.debug("Таблица %s: %s", table_name, e)
+                        LOG.debug("Table %s: %s", table_name, e)
                         continue
+
+            # Phase B: Read BLOCKZAP blobs for raw TLV decoding
+            for suffix in ('', '1', '2', '3'):
+                table_name = f'BLOCKZAP{suffix}' if suffix else 'BLOCKZAP'
+                try:
+                    cursor.execute(f'SELECT NUMBER, BLOCKLEN, BLOCK FROM {table_name}')
+                    for row in cursor:
+                        num, blen, blob_data = row[0], row[1], row[2]
+                        if hasattr(blob_data, 'read'):
+                            blob_data = blob_data.read()
+                        if blob_data and len(blob_data) > TLV_HEADER_SIZE:
+                            if isinstance(blob_data, str):
+                                blob_data = blob_data.encode('cp1251')
+                            blob_data = bytes(blob_data)
+                            tlv = TLVRecord.parse(blob_data)
+                            if tlv:
+                                decoded = dispatch_decode(tlv)
+                                self.upsert(decoded, tlv.raw)
+                                count += 1
+                except Exception as e:
+                    LOG.debug("Table %s: %s", table_name, e)
+                    continue
             conn.close()
             LOG.info("FDB импорт (Firebird): %d записей из %s", count, fdb_path)
             return count
@@ -1766,11 +1904,14 @@ def _create_gui_classes():
             """Инициализация вкладки Протоколы с таблицей записей A-scan и B-scan."""
             layout = QVBoxLayout(self._tab_protocols)
             self._tbl_protocols = QTableWidget()
-            self._tbl_protocols.setColumnCount(7)
+            self._tbl_protocols.setColumnCount(8)
             self._tbl_protocols.setHorizontalHeaderLabels([
-                "\u2116", "\u0414\u0430\u0442\u0430", "\u0412\u0440\u0435\u043c\u044f",
-                "\u0422\u0438\u043f", "\u041e\u0431\u044a\u0435\u043a\u0442",
-                "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440", "\u0412\u0435\u0440\u0434\u0438\u043a\u0442"
+                "\u0410\u0434\u0440\u0435\u0441", "\u0414\u0430\u0442\u0430",
+                "\u0412\u0440\u0435\u043c\u044f", "\u0422\u0438\u043f",
+                "\u2116 \u043e\u0431\u044a\u0435\u043a\u0442\u0430",
+                "\u041f\u043b\u0430\u0432\u043a\u0430",
+                "\u0414\u0435\u0444\u0435\u043a\u0442",
+                "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440"
             ])
             self._tbl_protocols.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self._tbl_protocols.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1782,11 +1923,23 @@ def _create_gui_classes():
             """Инициализация вкладки Отчеты с таблицей отчетных записей."""
             layout = QVBoxLayout(self._tab_reports)
             self._tbl_reports = QTableWidget()
-            self._tbl_reports.setColumnCount(7)
+            self._tbl_reports.setColumnCount(17)
             self._tbl_reports.setHorizontalHeaderLabels([
-                "\u2116", "\u0414\u0430\u0442\u0430", "\u0412\u0440\u0435\u043c\u044f",
-                "\u041e\u0431\u044a\u0435\u043a\u0442", "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440",
-                "\u0422\u0438\u043f", "\u0420\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442"
+                "\u0410\u0434\u0440\u0435\u0441", "\u0414\u0430\u0442\u0430",
+                "\u0412\u0440\u0435\u043c\u044f", "\u0422\u0438\u043f",
+                "\u2116 \u043e\u0431\u044a\u0435\u043a\u0442\u0430",
+                "\u041f\u043b\u0430\u0432\u043a\u0430",
+                "\u041a\u043b\u0435\u0439\u043c\u043e",
+                "\u0413\u043e\u0434",
+                "\u0421\u0442\u043e\u0440\u043e\u043d\u0430",
+                "\u0428\u0435\u0439\u043a\u0430",
+                "\u041e\u0431\u043e\u0434",
+                "\u041e\u0431\u0442\u043e\u0447\u043a\u0430",
+                "\u0413\u0440\u0435\u0431\u0435\u043d\u044c",
+                "\u041d\u0430\u043f\u043b\u0430\u0432\u043a\u0430",
+                "\u0414\u0435\u0444\u0435\u043a\u0442",
+                "\u041a\u043e\u0434 \u0434\u0435\u0444.",
+                "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440"
             ])
             self._tbl_reports.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self._tbl_reports.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1800,14 +1953,14 @@ def _create_gui_classes():
             self._tbl_settings = QTableWidget()
             self._tbl_settings.setColumnCount(9)
             self._tbl_settings.setHorizontalHeaderLabels([
-                "\u2116", "\u0414\u0430\u0442\u0430",
-                "\u0423\u0441\u0438\u043b\u0435\u043d\u0438\u0435 \u0434\u0411",
-                "\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c \u043c/\u0441",
-                "\u0423\u0433\u043e\u043b\u00b0",
+                "\u0410\u0434\u0440\u0435\u0441", "\u0414\u0430\u0442\u0430",
+                "\u0422\u0438\u043f",
+                "\u0423\u0441\u0438\u043b\u0435\u043d\u0438\u0435",
+                "\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c",
+                "\u0423\u0433\u043e\u043b",
                 "\u0421\u0442\u0440\u043e\u0431 \u043d\u0430\u0447.",
                 "\u0421\u0442\u0440\u043e\u0431 \u0448\u0438\u0440.",
-                "\u041f\u043e\u0440\u043e\u0433 %",
-                "\u0427\u0430\u0441\u0442\u043e\u0442\u0430"
+                "\u041f\u043e\u0440\u043e\u0433"
             ])
             self._tbl_settings.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self._tbl_settings.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1827,64 +1980,166 @@ def _create_gui_classes():
             """Обновляет таблицу протоколов из БД."""
             if not self._db:
                 return
-            records = self._db.filter_protocols()
-            self._tbl_protocols.setRowCount(len(records))
-            for i, rec in enumerate(records):
-                self._tbl_protocols.setItem(i, 0, QTableWidgetItem(str(rec.get("id", ""))))
-                self._tbl_protocols.setItem(i, 1, QTableWidgetItem(rec.get("date_str", "")))
-                self._tbl_protocols.setItem(i, 2, QTableWidgetItem(rec.get("time_str", "")))
-                self._tbl_protocols.setItem(i, 3, QTableWidgetItem(rec.get("category", "")))
-                self._tbl_protocols.setItem(i, 4, QTableWidgetItem(rec.get("passport_primary", "")))
-                self._tbl_protocols.setItem(i, 5, QTableWidgetItem(rec.get("passport_secondary", "")))
-                verdict = rec.get("verdict", "")
-                item = QTableWidgetItem(verdict)
-                if verdict == "\u0411\u0420\u0410\u041a":
-                    item.setForeground(QBrush(QColor(255, 0, 0)))
-                elif verdict == "\u041a\u041e\u041d\u0422\u0420\u041e\u041b\u042c":
-                    item.setForeground(QBrush(QColor(200, 200, 0)))
+            DASH = "\u2014"
+            rows = []
+            # FDB records (protocols = RESULTS)
+            for m in self._db.all_measurements():
+                src = m.get("source", "")
+                if src == "FDB-RESULTS":
+                    rows.append(m)
+            # Also add A_SCAN/B_SCAN from BlockZap
+            for rec in self._db.filter_protocols():
+                rows.append({
+                    "addr": rec.get("block_addr", rec.get("id", 0)),
+                    "date_str": rec.get("date_str", ""),
+                    "time_str": rec.get("time_str", ""),
+                    "type_name": rec.get("category", ""),
+                    "num_obj": rec.get("passport_primary", ""),
+                    "plavka": "",
+                    "defekt": "",
+                    "operator": rec.get("passport_secondary", ""),
+                    "source": "UART",
+                })
+            self._tbl_protocols.setSortingEnabled(False)
+            self._tbl_protocols.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                addr = r.get("addr", 0)
+                source = r.get("source", "")
+                if source.startswith("FDB-") and isinstance(addr, int) and addr >= 0xF0000000:
+                    num = addr & 0x0FFFFFFF
+                    addr_str = f"Results#{num}"
                 else:
-                    item.setForeground(QBrush(QColor(0, 180, 0)))
-                self._tbl_protocols.setItem(i, 6, item)
+                    addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
+                cells = [
+                    addr_str,
+                    r.get("date_str", "") or DASH,
+                    r.get("time_str", "") or DASH,
+                    r.get("type_name", "") or DASH,
+                    r.get("num_obj", "") or DASH,
+                    r.get("plavka", "") or DASH,
+                    r.get("defekt", "") or DASH,
+                    r.get("operator", "") or DASH,
+                ]
+                for j, cell in enumerate(cells):
+                    item = QTableWidgetItem(str(cell))
+                    if j == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, r)
+                    self._tbl_protocols.setItem(i, j, item)
+            self._tbl_protocols.setSortingEnabled(True)
+            self._tbl_protocols.resizeColumnsToContents()
 
         def _refresh_reports_table(self) -> None:
             """Обновляет таблицу отчетов из БД."""
             if not self._db:
                 return
-            records = self._db.filter_reports()
-            self._tbl_reports.setRowCount(len(records))
-            for i, rec in enumerate(records):
-                self._tbl_reports.setItem(i, 0, QTableWidgetItem(str(rec.get("id", ""))))
-                self._tbl_reports.setItem(i, 1, QTableWidgetItem(rec.get("date_str", "")))
-                self._tbl_reports.setItem(i, 2, QTableWidgetItem(rec.get("time_str", "")))
-                self._tbl_reports.setItem(i, 3, QTableWidgetItem(rec.get("passport_primary", "")))
-                self._tbl_reports.setItem(i, 4, QTableWidgetItem(rec.get("passport_secondary", "")))
-                self._tbl_reports.setItem(i, 5, QTableWidgetItem(rec.get("category", "")))
-                verdict = rec.get("verdict", "")
-                item = QTableWidgetItem(verdict)
-                if "\u0411\u0420\u0410\u041a" in verdict:
-                    item.setForeground(QBrush(QColor(255, 0, 0)))
-                elif "\u041a\u041e\u041d\u0422\u0420\u041e\u041b\u042c" in verdict:
-                    item.setForeground(QBrush(QColor(200, 150, 0)))
-                elif "\u0413\u041e\u0414\u0415\u041d" in verdict:
-                    item.setForeground(QBrush(QColor(0, 180, 0)))
-                self._tbl_reports.setItem(i, 6, item)
+            DASH = "\u2014"
+            rows = []
+            for m in self._db.all_measurements():
+                src = m.get("source", "")
+                if src in ("FDB-SHORTPROT", "UD2", "FDB-NASTR") or not src.startswith("FDB-RESULTS"):
+                    if src != "FDB-RESULTS" and src != "FDB-NASTR":
+                        rows.append(m)
+            self._tbl_reports.setSortingEnabled(False)
+            self._tbl_reports.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                addr = r.get("addr", 0)
+                source = r.get("source", "")
+                if source.startswith("FDB-") and isinstance(addr, int) and addr >= 0xF0000000:
+                    num = addr & 0x0FFFFFFF
+                    kind_short = source[4:].title()
+                    addr_str = f"{kind_short}#{num}"
+                else:
+                    addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
+                cells = [
+                    addr_str,
+                    r.get("date_str", "") or DASH,
+                    r.get("time_str", "") or DASH,
+                    r.get("type_name", "") or DASH,
+                    r.get("num_obj", "") or DASH,
+                    r.get("plavka", "") or DASH,
+                    r.get("stamp", "") or DASH,
+                    r.get("god", "") or DASH,
+                    r.get("side", "") or DASH,
+                    r.get("sheika", "") or DASH,
+                    r.get("obod", "") or DASH,
+                    r.get("obtochka", "") or DASH,
+                    r.get("greben", "") or DASH,
+                    r.get("naplavka", "") or DASH,
+                    r.get("defekt", "") or DASH,
+                    r.get("code_def", "") or DASH,
+                    r.get("operator", "") or DASH,
+                ]
+                for j, cell in enumerate(cells):
+                    item = QTableWidgetItem(str(cell))
+                    if j == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, r)
+                    self._tbl_reports.setItem(i, j, item)
+            self._tbl_reports.setSortingEnabled(True)
+            self._tbl_reports.resizeColumnsToContents()
 
         def _refresh_settings_table(self) -> None:
             """Обновляет таблицу настроек из БД."""
             if not self._db:
                 return
-            records = self._db.filter_settings()
-            self._tbl_settings.setRowCount(len(records))
-            for i, rec in enumerate(records):
-                self._tbl_settings.setItem(i, 0, QTableWidgetItem(str(rec.get("id", ""))))
-                self._tbl_settings.setItem(i, 1, QTableWidgetItem(rec.get("date_str", "")))
-                self._tbl_settings.setItem(i, 2, QTableWidgetItem(str(rec.get("gain_db", 0))))
-                self._tbl_settings.setItem(i, 3, QTableWidgetItem(str(rec.get("velocity_mps", 0))))
-                self._tbl_settings.setItem(i, 4, QTableWidgetItem(str(rec.get("angle_deg", 0))))
-                self._tbl_settings.setItem(i, 5, QTableWidgetItem(str(rec.get("gate_start", 0))))
-                self._tbl_settings.setItem(i, 6, QTableWidgetItem(str(rec.get("gate_width", 0))))
-                self._tbl_settings.setItem(i, 7, QTableWidgetItem(str(rec.get("threshold_pct", 0))))
-                self._tbl_settings.setItem(i, 8, QTableWidgetItem("2.5 MHz"))
+            DASH = "\u2014"
+            rows = []
+            # FDB settings
+            for m in self._db.all_measurements():
+                if m.get("source") == "FDB-NASTR":
+                    rows.append({
+                        "addr": m.get("addr", 0),
+                        "date_str": m.get("date_str", ""),
+                        "type_name": m.get("type_name", ""),
+                        "gain_db": 0,
+                        "velocity_mps": 0,
+                        "angle_deg": 0,
+                        "gate_start": 0,
+                        "gate_width": 0,
+                        "threshold_pct": 0,
+                        "source": "FDB-NASTR",
+                    })
+            # BlockZap settings
+            for rec in self._db.filter_settings():
+                rows.append({
+                    "addr": rec.get("block_addr", rec.get("id", 0)),
+                    "date_str": rec.get("date_str", ""),
+                    "type_name": rec.get("category", ""),
+                    "gain_db": rec.get("gain_db", 0),
+                    "velocity_mps": rec.get("velocity_mps", 0),
+                    "angle_deg": rec.get("angle_deg", 0),
+                    "gate_start": rec.get("gate_start", 0),
+                    "gate_width": rec.get("gate_width", 0),
+                    "threshold_pct": rec.get("threshold_pct", 0),
+                    "source": "UART",
+                })
+            self._tbl_settings.setSortingEnabled(False)
+            self._tbl_settings.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                addr = r.get("addr", 0)
+                source = r.get("source", "")
+                if source.startswith("FDB-") and isinstance(addr, int) and addr >= 0xF0000000:
+                    num = addr & 0x0FFFFFFF
+                    addr_str = f"Nastr#{num}"
+                else:
+                    addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
+                cells = [
+                    addr_str,
+                    r.get("date_str", "") or DASH,
+                    r.get("type_name", "") or DASH,
+                    str(r.get("gain_db", 0)),
+                    str(r.get("velocity_mps", 0)),
+                    str(r.get("angle_deg", 0)),
+                    str(r.get("gate_start", 0)),
+                    str(r.get("gate_width", 0)),
+                    str(r.get("threshold_pct", 0)),
+                ]
+                for j, cell in enumerate(cells):
+                    item = QTableWidgetItem(str(cell))
+                    if j == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, r)
+                    self._tbl_settings.setItem(i, j, item)
+            self._tbl_settings.setSortingEnabled(True)
+            self._tbl_settings.resizeColumnsToContents()
 
         # Placeholder methods referenced by menu/toolbar -- implemented in block 8 and 11
         def _on_protocol_double_click(self, index) -> None:
