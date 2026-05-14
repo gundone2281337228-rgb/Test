@@ -504,8 +504,6 @@ class UD2_102Port(PelengPort):
         """Инициализация драйвера UD2-102 с уменьшенной задержкой."""
         config.inter_byte_delay = INTER_BYTE_DELAY_UD2
         super().__init__(config)
-        self._streak_count: int = 0
-        self._max_streak: int = 100
 
     def handshake(self) -> Optional[bytes]:
         """Хэндшейк UD2-102: отправляет 4x 0x55, ожидает ответ."""
@@ -734,8 +732,8 @@ class MeasurementRecord:
     date_str:   str
     num_obj:    str
     plavka:     str
-    stamp:      int
-    god:        int
+    stamp:      int   # Reserved: populated only via FDB import path (заводской штамп)
+    god:        int   # Reserved: populated only via FDB import path (год изготовления)
     type_name:  str
     tcode:      int
     sub_b:      int
@@ -2988,7 +2986,7 @@ def _create_gui_classes():
 
             # Создаем QThread и воркер для фонового сканирования
             self._scan_thread = QThread()
-            self._scan_worker = ScanWorker(ud2, start_addr=0, end_addr=0xFFFF)
+            self._scan_worker = ScanWorker(ud2)
             self._scan_worker.moveToThread(self._scan_thread)
 
             # Соединяем сигналы воркера с обработчиками
@@ -3059,13 +3057,10 @@ def _create_gui_classes():
         finished = pyqtSignal(int)             # количество найденных записей
         error = pyqtSignal(str)                # сообщение об ошибке
 
-        def __init__(self, ud2: UD2_102Port, start_addr: int = 0,
-                     end_addr: int = 0xFFFF):
+        def __init__(self, ud2: UD2_102Port):
             """Инициализация воркера сканирования."""
             super().__init__()
             self._ud2 = ud2
-            self._start_addr = start_addr
-            self._end_addr = end_addr
             self._abort_event = threading.Event()
 
         def abort(self) -> None:
@@ -3386,6 +3381,49 @@ def _create_gui_classes():
 # ============= 8. DOUBLE-CLICK HANDLERS =============
 
 
+def _is_ud2_measurement_row(row_data: dict) -> bool:
+    """Check if row_data originates from a UD2 measurement (not a UART BlockZap record).
+
+    UD2 measurement rows have source like 'FDB-RESULTS', 'FDB-SHORTPROT', or 'UD2'.
+    UART BlockZap rows have source='UART' and may have type_name from category
+    (e.g. 'A_SCAN', 'B_SCAN') which should NOT trigger UD2 dialog.
+    """
+    source = row_data.get("source", "")
+    return source.startswith("FDB-") or source == "UD2"
+
+
+def _show_ud2_bcd_dialog(window, mr) -> None:
+    """Show a DecryptionDialog populated with decoded UD2 BCD measurement fields.
+
+    Args:
+        window: parent QWidget for the dialog
+        mr: MeasurementRecord instance or dict-like with UD2 fields
+    """
+    DecryptionDialogCls, _, _ = _create_dialog_classes()
+    if not DecryptionDialogCls:
+        return
+    rec = DecodedRecord()
+    if isinstance(mr, dict):
+        rec.fields = dict(mr)
+        rec.category_name = mr.get("type_name", "УД2-102")
+    else:
+        rec.fields = {
+            "type_name": mr.type_name,
+            "date_str": mr.date_str,
+            "num_obj": mr.num_obj,
+            "plavka": mr.plavka,
+            "side": mr.side,
+            "sheika": mr.sheika,
+            "obod": mr.obod,
+            "obtochka": mr.obtochka,
+            "greben": mr.greben,
+            "naplavka": mr.naplavka,
+        }
+        rec.category_name = mr.type_name
+    dlg = DecryptionDialogCls(window, rec)
+    dlg.exec()
+
+
 def _handle_protocol_double_click(window, row: int) -> None:
     """Обработчик двойного клика по строке протоколов: открывает граф + расшифровку."""
     if not _PYQT_AVAILABLE:
@@ -3399,16 +3437,10 @@ def _handle_protocol_double_click(window, row: int) -> None:
     if not row_data:
         return
 
-    # Проверяем, есть ли UD2 measurement поля в row_data
-    if row_data.get("num_obj") or row_data.get("plavka") or row_data.get("type_name"):
+    # Проверяем, является ли запись UD2 measurement (по полю source)
+    if _is_ud2_measurement_row(row_data):
         # UD2 measurement record -- показываем расшифровку BCD полей
-        DecryptionDialogCls, _, _ = _create_dialog_classes()
-        if DecryptionDialogCls:
-            rec = DecodedRecord()
-            rec.fields = dict(row_data)
-            rec.category_name = row_data.get("type_name", "УД2-102")
-            dlg = DecryptionDialogCls(window, rec)
-            dlg.exec()
+        _show_ud2_bcd_dialog(window, row_data)
         return
 
     # Пробуем получить BLOB из BlockZap
@@ -3423,24 +3455,7 @@ def _handle_protocol_double_click(window, row: int) -> None:
         # Пробуем BCD-парсинг из BLOB
         mr = _try_extract_ud2_bcd_from_tlv(blob)
         if mr is not None:
-            DecryptionDialogCls, _, _ = _create_dialog_classes()
-            if DecryptionDialogCls:
-                rec = DecodedRecord()
-                rec.fields = {
-                    "type_name": mr.type_name,
-                    "date_str": mr.date_str,
-                    "num_obj": mr.num_obj,
-                    "plavka": mr.plavka,
-                    "side": mr.side,
-                    "sheika": mr.sheika,
-                    "obod": mr.obod,
-                    "obtochka": mr.obtochka,
-                    "greben": mr.greben,
-                    "naplavka": mr.naplavka,
-                }
-                rec.category_name = mr.type_name
-                dlg = DecryptionDialogCls(window, rec)
-                dlg.exec()
+            _show_ud2_bcd_dialog(window, mr)
             return
         tlv = TLVRecord.parse(blob)
         if tlv:
@@ -3473,15 +3488,9 @@ def _handle_report_double_click(window, row: int) -> None:
     if not row_data:
         return
 
-    # Проверяем, есть ли UD2 measurement поля в row_data
-    if row_data.get("num_obj") or row_data.get("plavka") or row_data.get("type_name"):
-        DecryptionDialogCls, _, _ = _create_dialog_classes()
-        if DecryptionDialogCls:
-            rec = DecodedRecord()
-            rec.fields = dict(row_data)
-            rec.category_name = row_data.get("type_name", "УД2-102")
-            dlg = DecryptionDialogCls(window, rec)
-            dlg.exec()
+    # Проверяем, является ли запись UD2 measurement (по полю source)
+    if _is_ud2_measurement_row(row_data):
+        _show_ud2_bcd_dialog(window, row_data)
         return
 
     rec_id = row_data.get("id") or row_data.get("_blockzap_id")
@@ -3495,24 +3504,7 @@ def _handle_report_double_click(window, row: int) -> None:
         # Пробуем BCD-парсинг из BLOB
         mr = _try_extract_ud2_bcd_from_tlv(blob)
         if mr is not None:
-            DecryptionDialogCls, _, _ = _create_dialog_classes()
-            if DecryptionDialogCls:
-                rec = DecodedRecord()
-                rec.fields = {
-                    "type_name": mr.type_name,
-                    "date_str": mr.date_str,
-                    "num_obj": mr.num_obj,
-                    "plavka": mr.plavka,
-                    "side": mr.side,
-                    "sheika": mr.sheika,
-                    "obod": mr.obod,
-                    "obtochka": mr.obtochka,
-                    "greben": mr.greben,
-                    "naplavka": mr.naplavka,
-                }
-                rec.category_name = mr.type_name
-                dlg = DecryptionDialogCls(window, rec)
-                dlg.exec()
+            _show_ud2_bcd_dialog(window, mr)
             return
         tlv = TLVRecord.parse(blob)
         if tlv:
