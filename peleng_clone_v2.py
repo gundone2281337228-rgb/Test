@@ -626,7 +626,16 @@ def decode_date(body: bytes, offset: int = BODY_OFFSET_DATE_DAY) -> Optional[_dt
         return None
     day = body[offset]
     month = body[offset + 1]
-    year = 2000 + body[offset + 2]
+    year_raw = body[offset + 2]
+    year = 2000 + year_raw
+    # Валидация: если дата невалидна, попробовать альтернативный порядок
+    if not (1 <= day <= 31 and 1 <= month <= 12 and 2000 < year < 2100):
+        # Попытка: может быть порядок (month, day, year) - иногда встречается
+        if 1 <= month <= 31 and 1 <= day <= 12:
+            day, month = month, day
+            year = 2000 + year_raw
+        else:
+            return None
     try:
         return _dt.date(year, month, day)
     except (ValueError, OverflowError):
@@ -1250,8 +1259,8 @@ class BlockZapDB:
         return self.filter_by_category(["GENERIC", "SHORT_PROTO", "UNKNOWN", ""])
 
     def filter_settings(self) -> List[Dict[str, Any]]:
-        """Возвращает записи настроек (Calibration)."""
-        return self.filter_by_category(["CALIBRATION"])
+        """Возвращает записи настроек (Calibration, Settings)."""
+        return self.filter_by_category(["CALIBRATION", "SETTINGS"])
 
     def import_fdb(self, fdb_path: str) -> int:
         """Импорт записей из файла FDB (Firebird 2.x база данных PelengPC).
@@ -1312,7 +1321,7 @@ class BlockZapDB:
                         blob_data = row[0]
                         if blob_data and len(blob_data) > TLV_HEADER_SIZE:
                             if isinstance(blob_data, str):
-                                blob_data = blob_data.encode('latin-1')
+                                blob_data = blob_data.encode('cp1251')
                             tlv = TLVRecord.parse(bytes(blob_data))
                             if tlv:
                                 decoded = dispatch_decode(tlv)
@@ -1321,6 +1330,33 @@ class BlockZapDB:
                 except Exception as e:
                     LOG.debug("Таблица %s: %s", table_name, e)
                     continue
+            # Также читаем таблицы результатов (RESULTS, SHORTPROT, NASTR)
+            # В этих таблицах данные хранятся в текстовых полях (CP1251)
+            for suffix in ('2', '1', '3', ''):
+                for base_table in ('RESULTS', 'SHORTPROT', 'NASTR'):
+                    table_name = f'{base_table}{suffix}' if suffix else base_table
+                    try:
+                        cursor.execute(f'SELECT * FROM {table_name}')
+                        col_names = [desc[0].upper() for desc in cursor.description]
+                        for row in cursor:
+                            row_dict = dict(zip(col_names, row))
+                            # Ищем BLOB поле (BLOCK_BLOB, BLOB, DATA)
+                            blob_data = None
+                            for blob_col in ('BLOCK_BLOB', 'BLOB', 'DATA', 'RAW_DATA'):
+                                if blob_col in row_dict and row_dict[blob_col]:
+                                    blob_data = row_dict[blob_col]
+                                    break
+                            if blob_data:
+                                if isinstance(blob_data, str):
+                                    blob_data = blob_data.encode('cp1251')
+                                tlv = TLVRecord.parse(bytes(blob_data))
+                                if tlv:
+                                    decoded = dispatch_decode(tlv)
+                                    self.upsert(decoded, tlv.raw)
+                                    count += 1
+                    except Exception as e:
+                        LOG.debug("Таблица %s: %s", table_name, e)
+                        continue
             conn.close()
             LOG.info("FDB импорт (Firebird): %d записей из %s", count, fdb_path)
             return count
@@ -1746,12 +1782,11 @@ def _create_gui_classes():
             """Инициализация вкладки Отчеты с таблицей отчетных записей."""
             layout = QVBoxLayout(self._tab_reports)
             self._tbl_reports = QTableWidget()
-            self._tbl_reports.setColumnCount(8)
+            self._tbl_reports.setColumnCount(7)
             self._tbl_reports.setHorizontalHeaderLabels([
                 "\u2116", "\u0414\u0430\u0442\u0430", "\u0412\u0440\u0435\u043c\u044f",
-                "\u0422\u0438\u043f", "\u041e\u0431\u044a\u0435\u043a\u0442",
-                "\u0422\u043e\u043b\u0449\u0438\u043d\u0430", "\u0410\u043c\u043f\u043b\u0438\u0442\u0443\u0434\u0430",
-                "\u0412\u0435\u0440\u0434\u0438\u043a\u0442"
+                "\u041e\u0431\u044a\u0435\u043a\u0442", "\u041e\u043f\u0435\u0440\u0430\u0442\u043e\u0440",
+                "\u0422\u0438\u043f", "\u0420\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442"
             ])
             self._tbl_reports.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self._tbl_reports.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1821,11 +1856,18 @@ def _create_gui_classes():
                 self._tbl_reports.setItem(i, 0, QTableWidgetItem(str(rec.get("id", ""))))
                 self._tbl_reports.setItem(i, 1, QTableWidgetItem(rec.get("date_str", "")))
                 self._tbl_reports.setItem(i, 2, QTableWidgetItem(rec.get("time_str", "")))
-                self._tbl_reports.setItem(i, 3, QTableWidgetItem(rec.get("category", "")))
-                self._tbl_reports.setItem(i, 4, QTableWidgetItem(rec.get("passport_primary", "")))
-                self._tbl_reports.setItem(i, 5, QTableWidgetItem(f"{rec.get('thickness_mm', 0.0):.2f}"))
-                self._tbl_reports.setItem(i, 6, QTableWidgetItem(f"{rec.get('amplitude_db', 0.0):.1f}"))
-                self._tbl_reports.setItem(i, 7, QTableWidgetItem(rec.get("verdict", "")))
+                self._tbl_reports.setItem(i, 3, QTableWidgetItem(rec.get("passport_primary", "")))
+                self._tbl_reports.setItem(i, 4, QTableWidgetItem(rec.get("passport_secondary", "")))
+                self._tbl_reports.setItem(i, 5, QTableWidgetItem(rec.get("category", "")))
+                verdict = rec.get("verdict", "")
+                item = QTableWidgetItem(verdict)
+                if "\u0411\u0420\u0410\u041a" in verdict:
+                    item.setForeground(QBrush(QColor(255, 0, 0)))
+                elif "\u041a\u041e\u041d\u0422\u0420\u041e\u041b\u042c" in verdict:
+                    item.setForeground(QBrush(QColor(200, 150, 0)))
+                elif "\u0413\u041e\u0414\u0415\u041d" in verdict:
+                    item.setForeground(QBrush(QColor(0, 180, 0)))
+                self._tbl_reports.setItem(i, 6, item)
 
         def _refresh_settings_table(self) -> None:
             """Обновляет таблицу настроек из БД."""
@@ -1920,7 +1962,8 @@ def _create_gui_classes():
             self._recv_worker.finished.connect(self._on_receive_finished)
             self._recv_worker.error.connect(self._on_receive_error)
             # Кнопка "Остановить" устанавливает флаг отмены в воркере
-            self._recv_dialog.btn_stop.clicked.connect(self._recv_worker.abort)
+            self._recv_dialog.btn_stop.clicked.connect(
+                self._recv_worker.abort, Qt.ConnectionType.DirectConnection)
             # Запуск фонового потока
             self._recv_thread.started.connect(self._recv_worker.run)
             self._recv_thread.start()
@@ -2117,7 +2160,8 @@ def _create_gui_classes():
             self._scan_worker.error.connect(self._on_scan_error)
 
             # Кнопка "Остановить" устанавливает флаг отмены в воркере
-            self._scan_dialog.btn_stop.clicked.connect(self._scan_worker.abort)
+            self._scan_dialog.btn_stop.clicked.connect(
+                self._scan_worker.abort, Qt.ConnectionType.DirectConnection)
 
             # Запуск фонового потока
             self._scan_thread.started.connect(self._scan_worker.run)
@@ -2180,12 +2224,12 @@ def _create_gui_classes():
             self._ud2 = ud2
             self._start_addr = start_addr
             self._end_addr = end_addr
-            self._abort_flag = False
+            self._abort_event = threading.Event()
             self._max_streak = 100
 
         def abort(self) -> None:
-            """Установка флага прерывания сканирования."""
-            self._abort_flag = True
+            """Установка флага прерывания сканирования (потокобезопасно)."""
+            self._abort_event.set()
 
         def run(self) -> None:
             """Основной цикл сканирования (выполняется в фоновом потоке)."""
@@ -2195,7 +2239,7 @@ def _create_gui_classes():
                 addr = self._start_addr
                 while addr <= self._end_addr:
                     # Проверяем флаг отмены
-                    if self._abort_flag:
+                    if self._abort_event.is_set():
                         break
 
                     lo = addr & 0xFF
@@ -2337,11 +2381,11 @@ def _create_gui_classes():
             super().__init__()
             self._port = port
             self._catalog_addrs = catalog_addrs
-            self._abort_flag = False
+            self._abort_event = threading.Event()
 
         def abort(self) -> None:
-            """Установка флага прерывания приёма."""
-            self._abort_flag = True
+            """Установка флага прерывания приёма (потокобезопасно)."""
+            self._abort_event.set()
 
         def run(self) -> None:
             """Основной цикл чтения блоков по адресам каталога."""
@@ -2349,7 +2393,7 @@ def _create_gui_classes():
                 total = len(self._catalog_addrs)
                 count = 0
                 for idx, addr in enumerate(self._catalog_addrs):
-                    if self._abort_flag:
+                    if self._abort_event.is_set():
                         break
                     self.status.emit(
                         f"Чтение блока {idx + 1}/{total}: 0x{addr:04X}"
