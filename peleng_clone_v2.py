@@ -1216,7 +1216,8 @@ class BlockZapDB:
     def __init__(self, db_path: str = ":memory:"):
         """Открывает или создает базу данных SQLite."""
         self._path = db_path
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(self.CREATE_SQL)
         self._conn.commit()
@@ -1603,15 +1604,17 @@ class BlockZapDB:
 
         Сканирует файл на наличие валидных TLV-записей без Firebird клиента.
         Работает благодаря тому что BLOB данные хранятся в страницах FDB как есть.
+        Используется 2-байтовое выравнивание для ускорения сканирования.
         Проверяет: tag в диапазоне sweep_addr (1000-29999), разумная длина,
-        sweep_addr в body совпадает с tag по семейству.
+        валидность определяется ИЛИ по дате ИЛИ по совпадению body_sweep с семейством tag.
+        Записи с категорией UNKNOWN пропускаются только если нет даты.
         """
         count = 0
         offset = 0
         file_len = len(data)
 
         while offset < file_len - TLV_HEADER_SIZE:
-            # Читаем потенциальный TLV заголовок
+            # Читаем потенциальный TLV заголовок (2-байтовое выравнивание)
             tag = struct.unpack_from('<H', data, offset)[0]
 
             # Пропуск padding и нулей
@@ -1621,7 +1624,7 @@ class BlockZapDB:
 
             # tag должен быть валидным sweep_addr (диапазон 1000-29999)
             if not (1000 <= tag <= 29999):
-                offset += 1
+                offset += 2
                 continue
 
             length = struct.unpack_from('<H', data, offset + 2)[0]
@@ -1629,35 +1632,41 @@ class BlockZapDB:
             # Длина должна быть разумной: минимум 0x12 (чтобы содержать sweep_addr),
             # максимум 8192 байт (самая большая запись -- B-scan ~4K)
             if length < 0x12 or length > 8192:
-                offset += 1
+                offset += 2
                 continue
 
             # Проверяем что хватает данных
             if offset + TLV_HEADER_SIZE + length > file_len:
-                offset += 1
+                offset += 2
                 continue
 
             body = data[offset + TLV_HEADER_SIZE: offset + TLV_HEADER_SIZE + length]
 
-            # Дополнительная валидация: sweep_addr внутри body (смещение 0x10)
-            # должен совпадать с tag или быть в том же семействе (sweep_addr//1000 == tag//1000)
+            # Расширенная валидация: принимаем запись если ЛИБО дата валидна,
+            # ЛИБО body_sweep совпадает с tag по семейству
             body_sweep = struct.unpack_from('<H', body, BODY_OFFSET_SWEEP_ADDR)[0]
-            if body_sweep != tag and (body_sweep // 1000 != tag // 1000):
-                offset += 1
-                continue
+            sweep_family_match = (body_sweep == tag or body_sweep // 1000 == tag // 1000)
 
-            # Дополнительная проверка: дата должна быть правдоподобной
-            # body[7]=день (1-31), body[8]=месяц (1-12), body[9]=год (0-99)
+            # Проверка даты: body[7]=день (1-31), body[8]=месяц (1-12), body[9]=год (0-99)
             day = body[BODY_OFFSET_DATE_DAY] if len(body) > BODY_OFFSET_DATE_DAY else 0
             month = body[BODY_OFFSET_DATE_DAY + 1] if len(body) > BODY_OFFSET_DATE_DAY + 1 else 0
-            if not (1 <= day <= 31 and 1 <= month <= 12):
-                offset += 1
+            date_valid = (1 <= day <= 31 and 1 <= month <= 12)
+
+            # Принимаем запись если дата валидна ИЛИ body_sweep совпадает по семейству
+            if not date_valid and not sweep_family_match:
+                offset += 2
                 continue
 
             # Все проверки пройдены -- это валидная TLV запись
             raw = data[offset: offset + TLV_HEADER_SIZE + length]
             tlv = TLVRecord(tag=tag, length=length, body=body, raw=raw)
             decoded = dispatch_decode(tlv)
+
+            # Пропускаем UNKNOWN записи только если нет валидной даты
+            if decoded.category_name == "UNKNOWN" and not date_valid:
+                offset += 2
+                continue
+
             self.upsert(decoded, tlv.raw)
             count += 1
             offset += TLV_HEADER_SIZE + length
@@ -2071,232 +2080,241 @@ def _create_gui_classes():
             """Обновляет таблицу протоколов из БД (все записи BlockZap + FDB-RESULTS)."""
             if not self._db:
                 return
-            DASH = "\u2014"
-            rows = []
-            # ВСЕ записи из BlockZap (от прибора через UART или TLV-парсинг)
-            for rec in self._db.all_records():
-                rows.append({
-                    "id": rec.get("id"),
-                    "_blockzap_id": rec.get("id"),
-                    "addr": rec.get("block_addr", rec.get("sweep_addr", rec.get("id", 0))),
-                    "date_str": rec.get("date_str", ""),
-                    "time_str": rec.get("time_str", ""),
-                    "type_name": rec.get("category", ""),
-                    "num_obj": rec.get("passport_primary", ""),
-                    "plavka": "",
-                    "stamp": "",
-                    "god": "",
-                    "side": "",
-                    "sheika": "",
-                    "obod": "",
-                    "obtochka": "",
-                    "greben": "",
-                    "naplavka": "",
-                    "ind_maker": "",
-                    "make_time": "",
-                    "defekt": rec.get("verdict", ""),
-                    "code_def": "",
-                    "operator": rec.get("passport_secondary", ""),
-                    "source": "UART",
-                })
-            # Записи FDB-RESULTS из Measurements
-            for m in self._db.all_measurements():
-                src = m.get("source", "")
-                if src == "FDB-RESULTS":
-                    rows.append(m)
-            self._tbl_protocols.setSortingEnabled(False)
-            self._tbl_protocols.setRowCount(len(rows))
-            for i, r in enumerate(rows):
-                addr = r.get("addr", 0)
-                source = r.get("source", "")
-                if source.startswith("FDB-") and isinstance(addr, int) and addr >= 0xF0000000:
-                    num = addr & 0x0FFFFFFF
-                    addr_str = f"Results#{num}"
-                else:
-                    addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
-                cells = [
-                    addr_str,
-                    _fmt_date_display(r.get("date_str", "") or "") or DASH,
-                    r.get("time_str", "") or DASH,
-                    r.get("type_name", "") or DASH,
-                    r.get("num_obj", "") or DASH,
-                    r.get("plavka", "") or DASH,
-                    r.get("stamp", "") or DASH,
-                    r.get("god", "") if r.get("god", "") not in ("", "0") else DASH,
-                    r.get("side", "") or DASH,
-                    r.get("sheika", "") or DASH,
-                    r.get("obod", "") or DASH,
-                    r.get("obtochka", "") or DASH,
-                    r.get("greben", "") or DASH,
-                    r.get("naplavka", "") or DASH,
-                    r.get("ind_maker", "") or DASH,
-                    _fmt_date_display(r.get("make_time", "") or "") or DASH,
-                    r.get("defekt", "") or DASH,
-                    r.get("code_def", "") or DASH,
-                    r.get("operator", "") or DASH,
-                    r.get("source", "") or DASH,
-                ]
-                for j, cell in enumerate(cells):
-                    item = QTableWidgetItem(str(cell))
-                    if j == 0:
-                        item.setData(Qt.ItemDataRole.UserRole, r)
-                    self._tbl_protocols.setItem(i, j, item)
-            self._tbl_protocols.setSortingEnabled(True)
-            self._tbl_protocols.resizeColumnsToContents()
+            try:
+                DASH = "\u2014"
+                rows = []
+                # ВСЕ записи из BlockZap (от прибора через UART или TLV-парсинг)
+                for rec in self._db.all_records():
+                    rows.append({
+                        "id": rec.get("id"),
+                        "_blockzap_id": rec.get("id"),
+                        "addr": rec.get("block_addr", rec.get("sweep_addr", rec.get("id", 0))),
+                        "date_str": rec.get("date_str", ""),
+                        "time_str": rec.get("time_str", ""),
+                        "type_name": rec.get("category", ""),
+                        "num_obj": rec.get("passport_primary", ""),
+                        "plavka": "",
+                        "stamp": "",
+                        "god": "",
+                        "side": "",
+                        "sheika": "",
+                        "obod": "",
+                        "obtochka": "",
+                        "greben": "",
+                        "naplavka": "",
+                        "ind_maker": "",
+                        "make_time": "",
+                        "defekt": rec.get("verdict", ""),
+                        "code_def": "",
+                        "operator": rec.get("passport_secondary", ""),
+                        "source": "UART",
+                    })
+                # Записи FDB-RESULTS из Measurements
+                for m in self._db.all_measurements():
+                    src = m.get("source", "")
+                    if src == "FDB-RESULTS":
+                        rows.append(m)
+                self._tbl_protocols.setSortingEnabled(False)
+                self._tbl_protocols.setRowCount(len(rows))
+                for i, r in enumerate(rows):
+                    addr = r.get("addr", 0)
+                    source = r.get("source", "")
+                    if source.startswith("FDB-") and isinstance(addr, int) and addr >= 0xF0000000:
+                        num = addr & 0x0FFFFFFF
+                        addr_str = f"Results#{num}"
+                    else:
+                        addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
+                    cells = [
+                        addr_str,
+                        _fmt_date_display(r.get("date_str", "") or "") or DASH,
+                        r.get("time_str", "") or DASH,
+                        r.get("type_name", "") or DASH,
+                        r.get("num_obj", "") or DASH,
+                        r.get("plavka", "") or DASH,
+                        r.get("stamp", "") or DASH,
+                        r.get("god", "") if r.get("god", "") not in ("", "0") else DASH,
+                        r.get("side", "") or DASH,
+                        r.get("sheika", "") or DASH,
+                        r.get("obod", "") or DASH,
+                        r.get("obtochka", "") or DASH,
+                        r.get("greben", "") or DASH,
+                        r.get("naplavka", "") or DASH,
+                        r.get("ind_maker", "") or DASH,
+                        _fmt_date_display(r.get("make_time", "") or "") or DASH,
+                        r.get("defekt", "") or DASH,
+                        r.get("code_def", "") or DASH,
+                        r.get("operator", "") or DASH,
+                        r.get("source", "") or DASH,
+                    ]
+                    for j, cell in enumerate(cells):
+                        item = QTableWidgetItem(str(cell))
+                        if j == 0:
+                            item.setData(Qt.ItemDataRole.UserRole, r)
+                        self._tbl_protocols.setItem(i, j, item)
+                self._tbl_protocols.setSortingEnabled(True)
+                self._tbl_protocols.resizeColumnsToContents()
+            except Exception as exc:
+                LOG.error("Ошибка обновления таблицы протоколов: %s", exc)
 
         def _refresh_reports_table(self) -> None:
             """Обновляет таблицу отчетов из БД (FDB-SHORTPROT/UD2 + BlockZap SHORT_PROTO/GENERIC/UNKNOWN)."""
             if not self._db:
                 return
-            DASH = "\u2014"
-            rows = []
-            # Записи FDB-SHORTPROT и UD2 из Measurements
-            for m in self._db.all_measurements():
-                src = m.get("source", "")
-                if src in ("FDB-SHORTPROT", "UD2"):
-                    rows.append(m)
-            # Записи SHORT_PROTO/GENERIC/UNKNOWN из BlockZap
-            for rec in self._db.filter_reports():
-                rows.append({
-                    "id": rec.get("id"),
-                    "_blockzap_id": rec.get("id"),
-                    "addr": rec.get("block_addr", rec.get("id", 0)),
-                    "date_str": rec.get("date_str", ""),
-                    "time_str": rec.get("time_str", ""),
-                    "type_name": rec.get("category", ""),
-                    "num_obj": rec.get("passport_primary", ""),
-                    "plavka": "",
-                    "stamp": "",
-                    "god": "",
-                    "side": "",
-                    "sheika": "",
-                    "obod": "",
-                    "obtochka": "",
-                    "greben": "",
-                    "naplavka": "",
-                    "ind_maker": "",
-                    "make_time": "",
-                    "defekt": rec.get("verdict", ""),
-                    "code_def": "",
-                    "operator": rec.get("passport_secondary", ""),
-                    "source": "UART",
-                })
-            self._tbl_reports.setSortingEnabled(False)
-            self._tbl_reports.setRowCount(len(rows))
-            for i, r in enumerate(rows):
-                addr = r.get("addr", 0)
-                source = r.get("source", "")
-                if source.startswith("FDB-") and isinstance(addr, int) and addr >= 0xF0000000:
-                    num = addr & 0x0FFFFFFF
-                    kind_short = source[4:].title()
-                    addr_str = f"{kind_short}#{num}"
-                else:
-                    addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
-                cells = [
-                    addr_str,
-                    _fmt_date_display(r.get("date_str", "") or "") or DASH,
-                    r.get("time_str", "") or DASH,
-                    r.get("type_name", "") or DASH,
-                    r.get("num_obj", "") or DASH,
-                    r.get("plavka", "") or DASH,
-                    r.get("stamp", "") or DASH,
-                    r.get("god", "") if r.get("god", "") not in ("", "0") else DASH,
-                    r.get("side", "") or DASH,
-                    r.get("sheika", "") or DASH,
-                    r.get("obod", "") or DASH,
-                    r.get("obtochka", "") or DASH,
-                    r.get("greben", "") or DASH,
-                    r.get("naplavka", "") or DASH,
-                    r.get("ind_maker", "") or DASH,
-                    _fmt_date_display(r.get("make_time", "") or "") or DASH,
-                    r.get("defekt", "") or DASH,
-                    r.get("code_def", "") or DASH,
-                    r.get("operator", "") or DASH,
-                    r.get("source", "") or DASH,
-                ]
-                for j, cell in enumerate(cells):
-                    item = QTableWidgetItem(str(cell))
-                    if j == 0:
-                        item.setData(Qt.ItemDataRole.UserRole, r)
-                    self._tbl_reports.setItem(i, j, item)
-            self._tbl_reports.setSortingEnabled(True)
-            self._tbl_reports.resizeColumnsToContents()
+            try:
+                DASH = "\u2014"
+                rows = []
+                # Записи FDB-SHORTPROT и UD2 из Measurements
+                for m in self._db.all_measurements():
+                    src = m.get("source", "")
+                    if src in ("FDB-SHORTPROT", "UD2"):
+                        rows.append(m)
+                # Записи SHORT_PROTO/GENERIC/UNKNOWN из BlockZap
+                for rec in self._db.filter_reports():
+                    rows.append({
+                        "id": rec.get("id"),
+                        "_blockzap_id": rec.get("id"),
+                        "addr": rec.get("block_addr", rec.get("id", 0)),
+                        "date_str": rec.get("date_str", ""),
+                        "time_str": rec.get("time_str", ""),
+                        "type_name": rec.get("category", ""),
+                        "num_obj": rec.get("passport_primary", ""),
+                        "plavka": "",
+                        "stamp": "",
+                        "god": "",
+                        "side": "",
+                        "sheika": "",
+                        "obod": "",
+                        "obtochka": "",
+                        "greben": "",
+                        "naplavka": "",
+                        "ind_maker": "",
+                        "make_time": "",
+                        "defekt": rec.get("verdict", ""),
+                        "code_def": "",
+                        "operator": rec.get("passport_secondary", ""),
+                        "source": "UART",
+                    })
+                self._tbl_reports.setSortingEnabled(False)
+                self._tbl_reports.setRowCount(len(rows))
+                for i, r in enumerate(rows):
+                    addr = r.get("addr", 0)
+                    source = r.get("source", "")
+                    if source.startswith("FDB-") and isinstance(addr, int) and addr >= 0xF0000000:
+                        num = addr & 0x0FFFFFFF
+                        kind_short = source[4:].title()
+                        addr_str = f"{kind_short}#{num}"
+                    else:
+                        addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
+                    cells = [
+                        addr_str,
+                        _fmt_date_display(r.get("date_str", "") or "") or DASH,
+                        r.get("time_str", "") or DASH,
+                        r.get("type_name", "") or DASH,
+                        r.get("num_obj", "") or DASH,
+                        r.get("plavka", "") or DASH,
+                        r.get("stamp", "") or DASH,
+                        r.get("god", "") if r.get("god", "") not in ("", "0") else DASH,
+                        r.get("side", "") or DASH,
+                        r.get("sheika", "") or DASH,
+                        r.get("obod", "") or DASH,
+                        r.get("obtochka", "") or DASH,
+                        r.get("greben", "") or DASH,
+                        r.get("naplavka", "") or DASH,
+                        r.get("ind_maker", "") or DASH,
+                        _fmt_date_display(r.get("make_time", "") or "") or DASH,
+                        r.get("defekt", "") or DASH,
+                        r.get("code_def", "") or DASH,
+                        r.get("operator", "") or DASH,
+                        r.get("source", "") or DASH,
+                    ]
+                    for j, cell in enumerate(cells):
+                        item = QTableWidgetItem(str(cell))
+                        if j == 0:
+                            item.setData(Qt.ItemDataRole.UserRole, r)
+                        self._tbl_reports.setItem(i, j, item)
+                self._tbl_reports.setSortingEnabled(True)
+                self._tbl_reports.resizeColumnsToContents()
+            except Exception as exc:
+                LOG.error("Ошибка обновления таблицы отчетов: %s", exc)
 
         def _refresh_settings_table(self) -> None:
             """Обновляет таблицу настроек из БД (FDB-NASTR + BlockZap CALIBRATION/SETTINGS)."""
             if not self._db:
                 return
-            DASH = "\u2014"
-            rows = []
-            # Записи FDB-NASTR из Measurements
-            for m in self._db.all_measurements():
-                if m.get("source") == "FDB-NASTR":
-                    rows.append(m)
-            # Записи CALIBRATION/SETTINGS из BlockZap
-            for rec in self._db.filter_settings():
-                rows.append({
-                    "id": rec.get("id"),
-                    "_blockzap_id": rec.get("id"),
-                    "addr": rec.get("block_addr", rec.get("id", 0)),
-                    "date_str": rec.get("date_str", ""),
-                    "time_str": rec.get("time_str", ""),
-                    "type_name": rec.get("category", ""),
-                    "num_obj": rec.get("passport_primary", ""),
-                    "plavka": "",
-                    "stamp": "",
-                    "god": "",
-                    "side": "",
-                    "sheika": "",
-                    "obod": "",
-                    "obtochka": "",
-                    "greben": "",
-                    "naplavka": "",
-                    "ind_maker": "",
-                    "make_time": "",
-                    "defekt": rec.get("verdict", ""),
-                    "code_def": "",
-                    "operator": rec.get("passport_secondary", ""),
-                    "source": "UART",
-                })
-            self._tbl_settings.setSortingEnabled(False)
-            self._tbl_settings.setRowCount(len(rows))
-            for i, r in enumerate(rows):
-                addr = r.get("addr", 0)
-                source = r.get("source", "")
-                if source.startswith("FDB-") and isinstance(addr, int) and addr >= 0xF0000000:
-                    num = addr & 0x0FFFFFFF
-                    addr_str = f"Nastr#{num}"
-                else:
-                    addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
-                cells = [
-                    addr_str,
-                    _fmt_date_display(r.get("date_str", "") or "") or DASH,
-                    r.get("time_str", "") or DASH,
-                    r.get("type_name", "") or DASH,
-                    r.get("num_obj", "") or DASH,
-                    r.get("plavka", "") or DASH,
-                    r.get("stamp", "") or DASH,
-                    r.get("god", "") if r.get("god", "") not in ("", "0") else DASH,
-                    r.get("side", "") or DASH,
-                    r.get("sheika", "") or DASH,
-                    r.get("obod", "") or DASH,
-                    r.get("obtochka", "") or DASH,
-                    r.get("greben", "") or DASH,
-                    r.get("naplavka", "") or DASH,
-                    r.get("ind_maker", "") or DASH,
-                    _fmt_date_display(r.get("make_time", "") or "") or DASH,
-                    r.get("defekt", "") or DASH,
-                    r.get("code_def", "") or DASH,
-                    r.get("operator", "") or DASH,
-                    r.get("source", "") or DASH,
-                ]
-                for j, cell in enumerate(cells):
-                    item = QTableWidgetItem(str(cell))
-                    if j == 0:
-                        item.setData(Qt.ItemDataRole.UserRole, r)
-                    self._tbl_settings.setItem(i, j, item)
-            self._tbl_settings.setSortingEnabled(True)
-            self._tbl_settings.resizeColumnsToContents()
+            try:
+                DASH = "\u2014"
+                rows = []
+                # Записи FDB-NASTR из Measurements
+                for m in self._db.all_measurements():
+                    if m.get("source") == "FDB-NASTR":
+                        rows.append(m)
+                # Записи CALIBRATION/SETTINGS из BlockZap
+                for rec in self._db.filter_settings():
+                    rows.append({
+                        "id": rec.get("id"),
+                        "_blockzap_id": rec.get("id"),
+                        "addr": rec.get("block_addr", rec.get("id", 0)),
+                        "date_str": rec.get("date_str", ""),
+                        "time_str": rec.get("time_str", ""),
+                        "type_name": rec.get("category", ""),
+                        "num_obj": rec.get("passport_primary", ""),
+                        "plavka": "",
+                        "stamp": "",
+                        "god": "",
+                        "side": "",
+                        "sheika": "",
+                        "obod": "",
+                        "obtochka": "",
+                        "greben": "",
+                        "naplavka": "",
+                        "ind_maker": "",
+                        "make_time": "",
+                        "defekt": rec.get("verdict", ""),
+                        "code_def": "",
+                        "operator": rec.get("passport_secondary", ""),
+                        "source": "UART",
+                    })
+                self._tbl_settings.setSortingEnabled(False)
+                self._tbl_settings.setRowCount(len(rows))
+                for i, r in enumerate(rows):
+                    addr = r.get("addr", 0)
+                    source = r.get("source", "")
+                    if source.startswith("FDB-") and isinstance(addr, int) and addr >= 0xF0000000:
+                        num = addr & 0x0FFFFFFF
+                        addr_str = f"Nastr#{num}"
+                    else:
+                        addr_str = f"0x{addr:04x}" if isinstance(addr, int) else str(addr)
+                    cells = [
+                        addr_str,
+                        _fmt_date_display(r.get("date_str", "") or "") or DASH,
+                        r.get("time_str", "") or DASH,
+                        r.get("type_name", "") or DASH,
+                        r.get("num_obj", "") or DASH,
+                        r.get("plavka", "") or DASH,
+                        r.get("stamp", "") or DASH,
+                        r.get("god", "") if r.get("god", "") not in ("", "0") else DASH,
+                        r.get("side", "") or DASH,
+                        r.get("sheika", "") or DASH,
+                        r.get("obod", "") or DASH,
+                        r.get("obtochka", "") or DASH,
+                        r.get("greben", "") or DASH,
+                        r.get("naplavka", "") or DASH,
+                        r.get("ind_maker", "") or DASH,
+                        _fmt_date_display(r.get("make_time", "") or "") or DASH,
+                        r.get("defekt", "") or DASH,
+                        r.get("code_def", "") or DASH,
+                        r.get("operator", "") or DASH,
+                        r.get("source", "") or DASH,
+                    ]
+                    for j, cell in enumerate(cells):
+                        item = QTableWidgetItem(str(cell))
+                        if j == 0:
+                            item.setData(Qt.ItemDataRole.UserRole, r)
+                        self._tbl_settings.setItem(i, j, item)
+                self._tbl_settings.setSortingEnabled(True)
+                self._tbl_settings.resizeColumnsToContents()
+            except Exception as exc:
+                LOG.error("Ошибка обновления таблицы настроек: %s", exc)
 
         # Placeholder methods referenced by menu/toolbar -- implemented in block 8 and 11
         def _on_protocol_double_click(self, index) -> None:
@@ -2382,11 +2400,14 @@ def _create_gui_classes():
 
         def _on_receive_record_found(self, raw: bytes, decoded_info: str) -> None:
             """Обработка найденной записи при приёме: вставка в БД."""
-            if self._db:
-                tlv = TLVRecord.parse(raw)
-                if tlv:
-                    decoded = dispatch_decode(tlv)
-                    self._db.upsert(decoded, tlv.raw)
+            try:
+                if self._db:
+                    tlv = TLVRecord.parse(raw)
+                    if tlv:
+                        decoded = dispatch_decode(tlv)
+                        self._db.upsert(decoded, tlv.raw)
+            except Exception as exc:
+                LOG.error("Ошибка обработки записи при приёме: %s", exc)
 
         def _on_receive_finished(self, count: int) -> None:
             """Завершение приёма: закрытие диалога и обновление таблиц."""
@@ -2502,10 +2523,20 @@ def _create_gui_classes():
                 QApplication.processEvents()
                 count = self._db.import_fdb(path)
                 self._refresh_tables()
+                file_size = Path(path).stat().st_size
                 if count > 0:
                     self._statusbar.showMessage(f"\u0418\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u043e {count} \u0437\u0430\u043f\u0438\u0441\u0435\u0439 \u0438\u0437 {Path(path).name}")
                     QMessageBox.information(self, "\u0418\u043c\u043f\u043e\u0440\u0442 FDB",
                         f"\u0423\u0441\u043f\u0435\u0448\u043d\u043e \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u043e {count} \u0437\u0430\u043f\u0438\u0441\u0435\u0439")
+                    # Если файл большой но записей мало -- скорее всего бинарный сканер
+                    # нашел не все; полный импорт возможен через пакет fdb
+                    if file_size > 1_000_000 and count < 1000:
+                        QMessageBox.warning(self, "\u0418\u043c\u043f\u043e\u0440\u0442 FDB",
+                            f"\u0424\u0430\u0439\u043b {Path(path).name} ({file_size // 1024} KB) "
+                            f"\u0441\u043e\u0434\u0435\u0440\u0436\u0438\u0442 \u0431\u043e\u043b\u044c\u0448\u0435 \u0434\u0430\u043d\u043d\u044b\u0445, "
+                            f"\u043d\u043e \u0431\u0438\u043d\u0430\u0440\u043d\u044b\u0439 \u0441\u043a\u0430\u043d\u0435\u0440 \u043d\u0430\u0448\u0451\u043b \u0442\u043e\u043b\u044c\u043a\u043e {count}.\n\n"
+                            "\u0414\u043b\u044f \u043f\u043e\u043b\u043d\u043e\u0433\u043e \u0438\u043c\u043f\u043e\u0440\u0442\u0430 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0435 \u043f\u0430\u043a\u0435\u0442 Firebird:\n"
+                            "  pip install fdb")
                 else:
                     self._statusbar.showMessage("\u0418\u043c\u043f\u043e\u0440\u0442: \u0437\u0430\u043f\u0438\u0441\u0438 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u044b")
                     QMessageBox.warning(self, "\u0418\u043c\u043f\u043e\u0440\u0442 FDB",
@@ -2581,11 +2612,14 @@ def _create_gui_classes():
 
         def _on_scan_record_found(self, raw: bytes, decoded_info: str) -> None:
             """Обработка найденной записи: вставка в БД."""
-            if self._db:
-                tlv = TLVRecord.parse(raw)
-                if tlv:
-                    decoded = dispatch_decode(tlv)
-                    self._db.upsert(decoded, tlv.raw)
+            try:
+                if self._db:
+                    tlv = TLVRecord.parse(raw)
+                    if tlv:
+                        decoded = dispatch_decode(tlv)
+                        self._db.upsert(decoded, tlv.raw)
+            except Exception as exc:
+                LOG.error("Ошибка обработки записи при сканировании: %s", exc)
 
         def _on_scan_finished(self, count: int) -> None:
             """Завершение сканирования: закрытие диалога и обновление таблиц."""
