@@ -1439,12 +1439,52 @@ class BlockZapDB:
                             side = sheika = obod = obtochka = greben = naplavka = ""
                             stamp = 0
                             god = 0
+                            bcd_blob = None
                             for blob_key in ('PROTOCOL', 'BCDDATA', 'DATA'):
                                 bcd_blob = row_dict.get(blob_key)
                                 if isinstance(bcd_blob, (bytes, bytearray)) and len(bcd_blob) >= 70:
                                     break
+                                bcd_blob = None
+                            if bcd_blob is not None:
+                                try:
+                                    # BCD passport fields at known offsets in UD2 protocol blob
+                                    # Offsets: stamp(2b @40), god(2b @42), side(1b @44),
+                                    # sheika(4b @45), obod(4b @49), obtochka(4b @53),
+                                    # greben(4b @57), naplavka(4b @61)
+                                    stamp_raw = int.from_bytes(bcd_blob[40:42], 'little')
+                                    if stamp_raw:
+                                        stamp = stamp_raw
+                                    god_raw = int.from_bytes(bcd_blob[42:44], 'little')
+                                    if god_raw:
+                                        god = god_raw
+                                    side_b = bcd_blob[44]
+                                    if side_b:
+                                        side = str(side_b)
+                                    sheika_raw = int.from_bytes(bcd_blob[45:49], 'little')
+                                    if sheika_raw:
+                                        sheika = f"{sheika_raw / 100:.2f}"
+                                    obod_raw = int.from_bytes(bcd_blob[49:53], 'little')
+                                    if obod_raw:
+                                        obod = f"{obod_raw / 100:.2f}"
+                                    obtochka_raw = int.from_bytes(bcd_blob[53:57], 'little')
+                                    if obtochka_raw:
+                                        obtochka = f"{obtochka_raw / 100:.2f}"
+                                    greben_raw = int.from_bytes(bcd_blob[57:61], 'little')
+                                    if greben_raw:
+                                        greben = f"{greben_raw / 100:.2f}"
+                                    naplavka_raw = int.from_bytes(bcd_blob[61:65], 'little')
+                                    if naplavka_raw:
+                                        naplavka = f"{naplavka_raw / 100:.2f}"
+                                except (IndexError, ValueError, struct.error):
+                                    pass  # blob too short or malformed, keep defaults
 
-                            addr = 0xF0000000 | number
+                            # Encode table kind in high nibble to avoid address collisions
+                            _table_addr_prefix = {
+                                'NASTR': 0xF1000000,
+                                'RESULTS': 0xF2000000,
+                                'SHORTPROT': 0xF3000000,
+                            }
+                            addr = _table_addr_prefix.get(base_table, 0xF0000000) | number
                             source = f"FDB-{base_table}"
 
                             fields = {
@@ -1454,7 +1494,7 @@ class BlockZapDB:
                                 "num_obj": num_obj,
                                 "plavka": smelting,
                                 "stamp": str(stamp) if stamp else "",
-                                "god": str(_fdb_make_year(make_time)) if make_time else "",
+                                "god": str(god) if god else (str(_fdb_make_year(make_time)) if make_time and _fdb_make_year(make_time) else ""),
                                 "side": side,
                                 "sheika": sheika,
                                 "obod": obod,
@@ -1478,9 +1518,16 @@ class BlockZapDB:
             for suffix in ('', '1', '2', '3'):
                 table_name = f'BLOCKZAP{suffix}' if suffix else 'BLOCKZAP'
                 try:
-                    cursor.execute(f'SELECT NUMBER, BLOCKLEN, BLOCK FROM {table_name}')
+                    try:
+                        cursor.execute(f'SELECT NUMBER, BLOCKLEN, BLOCK FROM {table_name}')
+                    except Exception:
+                        # Fallback: old schema may use BLOCK_BLOB instead of BLOCK
+                        cursor.execute(f'SELECT * FROM {table_name}')
+                    col_names_b = [desc[0].upper() for desc in cursor.description]
                     for row in cursor:
-                        num, blen, blob_data = row[0], row[1], row[2]
+                        row_b = dict(zip(col_names_b, row))
+                        num = row_b.get('NUMBER', 0)
+                        blob_data = row_b.get('BLOCK') or row_b.get('BLOCK_BLOB')
                         if hasattr(blob_data, 'read'):
                             blob_data = blob_data.read()
                         if blob_data and len(blob_data) > TLV_HEADER_SIZE:
@@ -2036,9 +2083,8 @@ def _create_gui_classes():
             rows = []
             for m in self._db.all_measurements():
                 src = m.get("source", "")
-                if src in ("FDB-SHORTPROT", "UD2", "FDB-NASTR") or not src.startswith("FDB-RESULTS"):
-                    if src != "FDB-RESULTS" and src != "FDB-NASTR":
-                        rows.append(m)
+                if src in ("FDB-SHORTPROT", "UD2"):
+                    rows.append(m)
             self._tbl_reports.setSortingEnabled(False)
             self._tbl_reports.setRowCount(len(rows))
             for i, r in enumerate(rows):
@@ -2058,7 +2104,7 @@ def _create_gui_classes():
                     r.get("num_obj", "") or DASH,
                     r.get("plavka", "") or DASH,
                     r.get("stamp", "") or DASH,
-                    r.get("god", "") or DASH,
+                    r.get("god", "") if r.get("god", "") not in ("", "0") else DASH,
                     r.get("side", "") or DASH,
                     r.get("sheika", "") or DASH,
                     r.get("obod", "") or DASH,
