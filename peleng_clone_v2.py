@@ -183,6 +183,11 @@ BODY_OFFSET_DATE_YEAR: int = 0x09          # +0x09: year - 2000
 BODY_OFFSET_TIME_HOUR: int = 0x0A          # +0x0A: hour
 BODY_OFFSET_TIME_MINUTE: int = 0x0B        # +0x0B: minute
 BODY_OFFSET_DEFECT_FLAG: int = 0x0C        # +0x0C: defect_flag
+# NOTE: sweep_addr occupies +0x10..+0x11 as LE16, and passport_primary starts at +0x11.
+# This one-byte overlap is intentional and matches the original DLL behavior: sweep_addr
+# is read first (at dispatch time) from offset 0x10 as a 2-byte LE16 for category routing,
+# then the same byte range is reinterpreted as part of the passport during field extraction.
+# See ROUND5 finding #191 (sweep_addr read) and #327 (passport_primary layout).
 BODY_OFFSET_SWEEP_ADDR: int = 0x10         # +0x10..+0x11: block_addr/sweep_addr (LE16)
 BODY_OFFSET_PASSPORT_PRIMARY: int = 0x11   # +0x11..+0x1B: passport_primary (11 bytes)
 BODY_OFFSET_PASSPORT_SECONDARY: int = 0x21 # +0x21..+0x27: passport_secondary (7 bytes)
@@ -285,6 +290,9 @@ class PelengPort:
 
     def test_port(self) -> Optional[bytes]:
         """Отправляет хэндшейк (0x55) и ожидает 16-байтный ответ."""
+        # NOTE: No checksum/CRC validation is performed on received data.
+        # The original PelengPC protocol does NOT use CRC or checksums on the wire
+        # (per ROUND5 finding #501). Integrity relies on the RS-232 parity bit (8-E-1).
         with self._lock:
             if not self.is_open:
                 if not self.open():
@@ -313,6 +321,8 @@ class PelengPort:
 
     def request_block(self, block_len: int) -> Optional[bytes]:
         """Запрашивает блок данных: отправляет 0x42 + LL + HH, читает block_len байт."""
+        # NOTE: No checksum/CRC validation on received block data - the original PelengPC
+        # protocol does not use checksums (per ROUND5 finding #501).
         with self._lock:
             if not self.is_open:
                 return None
@@ -972,7 +982,8 @@ class BlockZapDB:
         gate_width INTEGER DEFAULT 0,
         threshold_pct INTEGER DEFAULT 0,
         source TEXT DEFAULT '',
-        block_blob BLOB
+        block_blob BLOB,
+        UNIQUE(id)
     );
     CREATE TABLE IF NOT EXISTS Measurements (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -996,7 +1007,8 @@ class BlockZapDB:
         operator TEXT DEFAULT '',
         make_time TEXT DEFAULT '',
         ind_maker TEXT DEFAULT '',
-        block_blob BLOB
+        block_blob BLOB,
+        UNIQUE(addr, date_str, time_str, source)
     );
     """
 
@@ -1019,7 +1031,7 @@ class BlockZapDB:
     def upsert(self, record: DecodedRecord, blob: bytes) -> int:
         """Вставляет или обновляет запись в таблице BlockZap."""
         cursor = self._conn.execute(
-            """INSERT INTO BlockZap
+            """INSERT OR REPLACE INTO BlockZap
                (block_addr, sweep_addr, category, decoder_type, device_id, sweep_id,
                 date_str, time_str, defect_flag, passport_primary, passport_secondary,
                 verdict, thickness_mm, amplitude_db, gain_db, velocity_mps,
@@ -1049,7 +1061,7 @@ class BlockZapDB:
     def upsert_measurement(self, addr: int, fields: Dict[str, Any], blob: bytes) -> int:
         """Вставляет запись в таблицу Measurements."""
         cursor = self._conn.execute(
-            """INSERT INTO Measurements
+            """INSERT OR REPLACE INTO Measurements
                (addr, date_str, time_str, type_name, num_obj, plavka, stamp,
                 god, side, sheika, obod, obtochka, greben, naplavka, source,
                 defekt, code_def, operator, make_time, ind_maker, block_blob)
